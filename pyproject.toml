@@ -1,0 +1,40 @@
+[project]
+name = "lerobot-episode-scorer"
+version = "0.1.0"
+description = "Episode-level LeRobot scoring with quality metrics and optional I-FailSense execution scoring."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "av>=14.0.0",
+    "datasets>=3.0.0",
+    "huggingface-hub>=0.30.0",
+    "lerobot>=0.3.0",
+    "numpy>=2.1.0",
+    "pandas>=2.2.0",
+    "peft>=0.17.0",
+    "pillow>=11.0.0",
+    "torch>=2.5.0",
+    "transformers>=4.57.0",
+]
+
+[project.scripts]
+lerobot-episode-score = "lerobot_episode_scorer.cli:main"
+lerobot-episode-extract-features = "lerobot_episode_scorer.extract_features_cli:main"
+lerobot-episode-train-execution = "lerobot_episode_scorer.train_execution_cli:main"
+lerobot-episode-evaluate-execution = "lerobot_episode_scorer.evaluate_execution_cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.13.0",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.format]
+quote-style = "double"
