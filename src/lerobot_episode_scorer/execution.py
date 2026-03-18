@@ -15,7 +15,6 @@ DEFAULT_OLLAMA_MODEL = "qwen3.5:0.8b"
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 DEFAULT_LMSTUDIO_MODEL = "qwen/qwen3.5-9b"
 DEFAULT_LMSTUDIO_BASE_URL = "http://localhost:1234/v1"
-DEFAULT_MODEL = DEFAULT_LMSTUDIO_MODEL
 DEFAULT_BORDER_SIZE = 4
 DEFAULT_FRAMES_PER_EPISODE = 4
 DEFAULT_MAX_IMAGE_SIDE = 448
@@ -121,7 +120,7 @@ class BaseVLMScorer:
     def _build_prompt(self, task: str) -> str:
         return (
             "The image shows 4 frames from a robot episode arranged in a 2x2 grid "
-            "(top-left: start, top-right: ~25% progress, bottom-left: ~50% progress, "
+            "(top-left: start, top-right: ~33% progress, bottom-left: ~67% progress, "
             "bottom-right: end).\n"
             "Does this image show a successful execution of the following task?\n"
             f'Task: "{task}"\n\n'

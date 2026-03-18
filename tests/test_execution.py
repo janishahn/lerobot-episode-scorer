@@ -1,7 +1,10 @@
 import base64
+import csv
 import io
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import ANY, MagicMock, patch
 
 import numpy as np
@@ -13,13 +16,12 @@ from lerobot_episode_scorer.execution import (
     DEFAULT_LMSTUDIO_BASE_URL,
     DEFAULT_LMSTUDIO_MODEL,
     DEFAULT_MAX_IMAGE_SIDE,
-    DEFAULT_MODEL,
     LMStudioVLMScorer,
     OllamaVLMScorer,
     parse_success_response,
     stitch_frames,
 )
-from lerobot_episode_scorer.output import compute_summary
+from lerobot_episode_scorer.output import RollingOutputWriter, compute_summary, flatten_episode_row
 from lerobot_episode_scorer.quality import score_visual_frame
 
 
@@ -89,7 +91,6 @@ class TestParseSuccessResponse(unittest.TestCase):
 
 class TestLMStudioVLMScorer(unittest.TestCase):
     def test_default_constants(self) -> None:
-        self.assertEqual(DEFAULT_MODEL, DEFAULT_LMSTUDIO_MODEL)
         self.assertEqual(DEFAULT_LMSTUDIO_BASE_URL, "http://localhost:1234/v1")
         self.assertEqual(DEFAULT_BORDER_SIZE, 4)
         self.assertEqual(DEFAULT_FRAMES_PER_EPISODE, 4)
@@ -333,6 +334,109 @@ class TestOllamaVLMScorer(unittest.TestCase):
 
 
 class TestComputeSummary(unittest.TestCase):
+    def test_flatten_episode_row_uses_stable_camera_columns(self) -> None:
+        row = {
+            "repo_id": "demo/repo",
+            "dataset_family": "test",
+            "episode_index": 0,
+            "task": "pick",
+            "label": 1,
+            "quality_score": 0.8,
+            "execution_score": 0.9,
+            "execution_probability": 0.9,
+            "combined_score": 0.72,
+            "runtime_seconds": 10.0,
+            "quality_components": {
+                "visual_clarity": 0.7,
+                "smoothness": 0.8,
+                "path_efficiency": 0.8,
+                "collision": 1.0,
+                "joint_stability": 0.8,
+                "actuator_saturation": 0.8,
+                "runtime": 1.0,
+                "visual_clarity_by_camera": {"observation.images.top": 0.7},
+            },
+            "execution_backend": "lmstudio",
+            "vlm_response": "yes",
+            "reasoning_trace": None,
+            "camera_used": "observation.images.top",
+        }
+
+        flat_row = flatten_episode_row(
+            row,
+            ["observation.images.top", "observation.images.wrist"],
+        )
+
+        self.assertEqual(flat_row["observation_images_top_visual"], 0.7)
+        self.assertIsNone(flat_row["observation_images_wrist_visual"])
+
+    def test_rolling_output_writer_keeps_csv_schema_across_rows(self) -> None:
+        base_row = {
+            "repo_id": "demo/repo",
+            "dataset_family": "test",
+            "task": "pick",
+            "label": 1,
+            "quality_score": 0.8,
+            "execution_score": 0.9,
+            "execution_probability": 0.9,
+            "combined_score": 0.72,
+            "runtime_seconds": 10.0,
+            "quality_components": {
+                "visual_clarity": 0.7,
+                "smoothness": 0.8,
+                "path_efficiency": 0.8,
+                "collision": 1.0,
+                "joint_stability": 0.8,
+                "actuator_saturation": 0.8,
+                "runtime": 1.0,
+                "visual_clarity_by_camera": {"observation.images.top": 0.7},
+            },
+            "execution_backend": "lmstudio",
+            "vlm_response": "yes",
+            "reasoning_trace": None,
+            "camera_used": "observation.images.top",
+        }
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            writer = RollingOutputWriter(
+                output_dir=Path(tempdir),
+                execution_backend="lmstudio",
+                nominal_runtime_seconds=10.0,
+                camera_keys=["observation.images.top", "observation.images.wrist"],
+                execution_model="qwen/qwen3.5-9b",
+                repo_id="demo/repo",
+                dataset_family="test",
+            )
+            writer.add_episode(
+                {
+                    **base_row,
+                    "episode_index": 0,
+                }
+            )
+            writer.add_episode(
+                {
+                    **base_row,
+                    "episode_index": 1,
+                    "quality_components": {
+                        **base_row["quality_components"],
+                        "visual_clarity_by_camera": {
+                            "observation.images.wrist": 0.6,
+                            "observation.images.top": 0.5,
+                        },
+                    },
+                }
+            )
+            writer.finalize()
+
+            with (Path(tempdir) / "episode_scores.csv").open(newline="") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["observation_images_top_visual"], "0.7")
+        self.assertEqual(rows[0]["observation_images_wrist_visual"], "")
+        self.assertEqual(rows[1]["observation_images_top_visual"], "0.5")
+        self.assertEqual(rows[1]["observation_images_wrist_visual"], "0.6")
+
     def test_quality_and_execution_metrics_included(self) -> None:
         rows = [
             {

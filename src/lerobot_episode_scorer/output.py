@@ -2,11 +2,12 @@ import csv
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TextIO
 
 from lerobot_episode_scorer.metrics import compute_binary_metrics, sanitized_metrics
 
 
-def flatten_episode_row(row: dict) -> dict:
+def flatten_episode_row(row: dict, camera_keys: list[str] | None = None) -> dict:
     quality_components = row["quality_components"]
     flat_row = {
         "repo_id": row["repo_id"],
@@ -32,7 +33,9 @@ def flatten_episode_row(row: dict) -> dict:
         "runtime": quality_components["runtime"],
     }
 
-    for camera_key, score in quality_components["visual_clarity_by_camera"].items():
+    visual_clarity_by_camera = quality_components["visual_clarity_by_camera"]
+    for camera_key in camera_keys or list(visual_clarity_by_camera):
+        score = visual_clarity_by_camera.get(camera_key)
         flat_row[f"{camera_key.replace('.', '_')}_visual"] = score
 
     return flat_row
@@ -147,7 +150,7 @@ class RollingOutputWriter:
     dataset_family: str
     rows: list[dict] = field(default_factory=list)
     csv_writer: csv.DictWriter | None = field(default=None, repr=False)
-    csv_handle: object | None = field(default=None, repr=False)
+    csv_handle: TextIO | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -177,7 +180,7 @@ class RollingOutputWriter:
 
     def _append_csv_row(self, row: dict) -> None:
         path = self.output_dir / "episode_scores.csv"
-        flat_row = flatten_episode_row(row)
+        flat_row = flatten_episode_row(row, self.camera_keys)
 
         if self.csv_writer is None:
             self.csv_handle = path.open("w", newline="")
@@ -185,6 +188,7 @@ class RollingOutputWriter:
             self.csv_writer.writeheader()
 
         self.csv_writer.writerow(flat_row)
+        self.csv_handle.flush()
 
     def finalize(self) -> None:
         if self.csv_handle is not None:
