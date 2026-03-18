@@ -1,5 +1,6 @@
 import argparse
 import logging
+import random
 import time
 from pathlib import Path
 
@@ -18,6 +19,9 @@ from lerobot_episode_scorer.execution import (
 )
 from lerobot_episode_scorer.output import RollingOutputWriter
 from lerobot_episode_scorer.quality import EpisodeQualityScorer
+
+SAVE_EPISODE_SAMPLE_COUNT = 20
+SAVE_FRAMES_DIR = "saved_frames"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -101,6 +105,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=300.0,
         help="Seconds to keep the Ollama model loaded in memory (default: 300). Set to -1 for infinite.",
     )
+    parser.add_argument(
+        "--save-frames",
+        action="store_true",
+        help=(
+            f"Save stitched frame grids for up to {SAVE_EPISODE_SAMPLE_COUNT} random episodes "
+            "to disk for debugging."
+        ),
+    )
     return parser
 
 
@@ -157,6 +169,25 @@ def main() -> None:
             )
             elapsed = time.time() - start_time
             logging.info(f"Frame extraction episode {episode.episode_index}: {elapsed:.2f}s")
+
+    if args.save_frames and pre_extracted_frames:
+        frames_dir = args.output_dir / SAVE_FRAMES_DIR
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        sampled_episode_indices = random.sample(
+            list(pre_extracted_frames),
+            k=min(SAVE_EPISODE_SAMPLE_COUNT, len(pre_extracted_frames)),
+        )
+        print(
+            "Saving stitched frame grids for "
+            f"{len(sampled_episode_indices)} sampled episodes to disk..."
+        )
+        for episode_index in sampled_episode_indices:
+            for camera_key, stitched_image in pre_extracted_frames[episode_index].items():
+                filepath = (
+                    frames_dir / f"episode_{episode_index:03d}_{camera_key.replace('.', '_')}.jpg"
+                )
+                stitched_image.save(filepath, "JPEG", quality=95)
+                logging.info("Saved frame: %s", filepath)
 
     writer = RollingOutputWriter(
         output_dir=args.output_dir,
