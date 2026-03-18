@@ -1,926 +1,539 @@
-from collections.abc import Callable
-import json
-from dataclasses import dataclass
-from pathlib import Path
+"""Vision-language episode execution scoring via stitched frame grid."""
 
-import torch
-from peft import PeftModel
+import base64
+import io
+import json
+import multiprocessing as mp
+from urllib.request import Request, urlopen
+
+import ollama
 from PIL import Image
-from torch import nn
-from torch.utils.data import DataLoader, Dataset
-from transformers import AutoProcessor, PaliGemmaForConditionalGeneration
 
 from lerobot_episode_scorer.dataset import EpisodeRecord
-from lerobot_episode_scorer.metrics import compute_binary_metrics, sanitized_metrics
-from lerobot_episode_scorer.video import sample_segment_frames
+from lerobot_episode_scorer.video import sample_episode_frames
 
-BASE_MODEL_ID = "google/paligemma2-3b-mix-224"
-DEFAULT_VLM_MODEL_ID = "ACIDE/FailSense-Calvin-2p-3b"
-DEFAULT_FRAMES_PER_CAMERA = 4
-DEFAULT_THRESHOLD = 0.5
-
-
-@dataclass(frozen=True)
-class DatasetManifestEntry:
-    repo_id: str
-    dataset_family: str
-    split: str
-    root: Path | None
-    episode_from: int
-    episode_to: int | None
-    derived_label: int | None
-    label_rule: str | None
-    use_for_training: bool
-    use_for_evaluation: bool
+DEFAULT_OLLAMA_MODEL = "qwen3.5:0.8b"
+DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+DEFAULT_LMSTUDIO_MODEL = "qwen/qwen3.5-9b"
+DEFAULT_LMSTUDIO_BASE_URL = "http://localhost:1234/v1"
+DEFAULT_BORDER_SIZE = 4
+DEFAULT_FRAMES_PER_EPISODE = 4
+DEFAULT_MAX_IMAGE_SIDE = 448
+DEFAULT_LMSTUDIO_MAX_TOKENS = 128
+DEFAULT_EXECUTION_TIMEOUT_SECONDS = 60.0
 
 
-@dataclass(frozen=True)
-class FeatureIndexEntry:
-    feature_path: str
-    repo_id: str
-    dataset_family: str
-    split: str
-    use_for_training: bool
-    use_for_evaluation: bool
-    episode_index: int
-    task: str
-    label: int | None
-    quality_score: float
-    decoded_vote: str | None
-    num_tokens: int
+def stitch_frames(
+    frames: list,
+    border_size: int = DEFAULT_BORDER_SIZE,
+    border_color: tuple[int, int, int] = (0, 0, 0),
+) -> Image.Image:
+    if len(frames) != DEFAULT_FRAMES_PER_EPISODE:
+        raise ValueError(f"Expected {DEFAULT_FRAMES_PER_EPISODE} frames, got {len(frames)}")
+    frame_height, frame_width = frames[0].shape[:2]
+
+    grid_width = 2 * frame_width + border_size
+    grid_height = 2 * frame_height + border_size
+
+    grid_image = Image.new("RGB", (grid_width, grid_height), border_color)
+
+    positions = [
+        (0, 0),
+        (frame_width + border_size, 0),
+        (0, frame_height + border_size),
+        (frame_width + border_size, frame_height + border_size),
+    ]
+
+    for frame, (x, y) in zip(frames, positions, strict=True):
+        pil_frame = Image.fromarray(frame)
+        grid_image.paste(pil_frame, (x, y))
+
+    return grid_image
 
 
-@dataclass(frozen=True)
-class FeatureCacheIndex:
-    version: int
-    vlm_model_id: str
-    camera_keys: list[str]
-    frames_per_camera: int
-    hook_layer_indices: list[int]
-    feature_dim: int
-    records: list[FeatureIndexEntry]
+def parse_success_response(response: str) -> tuple[float, str]:
+    lowered = response.strip().lower()
+
+    if any(neg in lowered for neg in ["not success", "not successful", "unsuccessful"]):
+        return 0.0, response
+
+    success_indicators = {"yes", "success", "successful", "pass", "passed", "true", "1"}
+    failure_indicators = {"no", "fail", "failure", "failed", "false", "0"}
+
+    for indicator in success_indicators:
+        if indicator in lowered:
+            return 1.0, response
+
+    for indicator in failure_indicators:
+        if indicator in lowered:
+            return 0.0, response
+
+    return 0.5, response
 
 
-@dataclass(frozen=True)
-class ExecutionResult:
-    score: float
-    probability: float
-    decoded_vote: str | None
+class ExecutionBackendError(RuntimeError):
+    pass
 
 
-@dataclass(frozen=True)
-class ExecutionCheckpoint:
-    checkpoint_path: Path
-    backend_name: str
-    backend_version: int
-    vlm_model_id: str
-    camera_keys: list[str]
-    frames_per_camera: int
-    hook_layer_indices: list[int]
-    feature_dim: int
-    hidden_dim: int
-    dropout_rate: float
-    threshold: float
-    calibration_scale: float
-    calibration_bias: float
-    label_mapping: dict[str, int]
-    head_state_dict: dict[str, torch.Tensor]
+class ExecutionBackendTimeoutError(TimeoutError):
+    pass
 
 
-@dataclass(frozen=True)
-class FeatureBatch:
-    layer_features: list[torch.Tensor]
-    mask: torch.Tensor
-    labels: torch.Tensor
-    entries: list[FeatureIndexEntry]
+def _score_with_ollama_request(
+    model: str,
+    host: str,
+    prompt: str,
+    image_bytes: bytes,
+    think: bool,
+    keep_alive: float,
+) -> dict:
+    client = ollama.Client(host=host)
+    response = client.generate(
+        model=model,
+        prompt=prompt,
+        images=[image_bytes],
+        think=think,
+        keep_alive=keep_alive,
+    )
+    raw_response = response.get("response", "")
+    reasoning_trace = response.get("thinking")
+    probability, _ = parse_success_response(raw_response)
+    return {
+        "score": probability,
+        "probability": probability,
+        "raw_response": raw_response,
+        "reasoning_trace": reasoning_trace,
+    }
 
 
-def build_prompt(images: list[Image.Image], task: str) -> str:
-    return " ".join(["<image>"] * len(images)) + " evaluate en " + task
+def _score_with_lmstudio_request(
+    model: str,
+    base_url: str,
+    prompt: str,
+    image_bytes: bytes,
+    think: bool,
+    max_tokens: int,
+    timeout_seconds: float,
+) -> dict:
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    response_schema = {
+        "type": "object",
+        "properties": {
+            "success": {"type": "string", "enum": ["yes", "no"]},
+        },
+        "required": ["success"],
+        "additionalProperties": False,
+    }
+    if think:
+        response_schema["properties"]["reasoning"] = {"type": "string"}
+        response_schema["required"] = ["reasoning", "success"]
+
+    request = Request(
+        f"{base_url}/chat/completions",
+        data=json.dumps(
+            {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Assess the robot episode and return JSON that matches the "
+                            "schema exactly."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{image_b64}",
+                                },
+                            },
+                        ],
+                    },
+                ],
+                "temperature": 0,
+                "max_tokens": max_tokens,
+                "stream": False,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "episode_success",
+                        "schema": response_schema,
+                    },
+                },
+            }
+        ).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=timeout_seconds) as response:
+        response_json = json.loads(response.read().decode("utf-8"))
+
+    message = response_json["choices"][0]["message"]
+    content = message.get("content", "")
+    parsed_content = json.loads(content)
+    raw_response = str(parsed_content["success"])
+    reasoning_trace = None
+    if think:
+        reasoning_trace = str(parsed_content["reasoning"])
+    probability, _ = parse_success_response(raw_response)
+    return {
+        "score": probability,
+        "probability": probability,
+        "raw_response": raw_response,
+        "reasoning_trace": reasoning_trace,
+    }
 
 
-def normalize_label(value: object) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, int):
-        return int(value)
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"1", "true", "success", "pass"}:
-            return 1
-        if lowered in {"0", "false", "fail", "failure"}:
-            return 0
-    raise ValueError(f"Unsupported label value: {value!r}")
+def _ollama_worker_loop(
+    model: str,
+    host: str,
+    think: bool,
+    keep_alive: float,
+    connection,
+) -> None:
+    try:
+        while True:
+            try:
+                request = connection.recv()
+            except EOFError:
+                break
+
+            if request is None:
+                break
+
+            prompt = request["prompt"]
+            image_bytes = request["image_bytes"]
+            try:
+                response = {
+                    "ok": True,
+                    "value": _score_with_ollama_request(
+                        model=model,
+                        host=host,
+                        prompt=prompt,
+                        image_bytes=image_bytes,
+                        think=think,
+                        keep_alive=keep_alive,
+                    ),
+                }
+            except (KeyError, OSError, TimeoutError, ValueError, ollama.ResponseError) as exc:
+                response = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+            try:
+                connection.send(response)
+            except (BrokenPipeError, EOFError, OSError):
+                break
+    finally:
+        connection.close()
 
 
-def decode_vote_to_label(decoded_vote: str | None) -> int | None:
-    if decoded_vote is None:
-        return None
-    lowered = decoded_vote.strip().lower()
-    if lowered in {"1", "success", "pass"}:
-        return 1
-    if lowered in {"0", "fail", "failure"}:
-        return 0
-    return None
+def _lmstudio_worker_loop(
+    model: str,
+    base_url: str,
+    think: bool,
+    max_tokens: int,
+    timeout_seconds: float,
+    connection,
+) -> None:
+    try:
+        while True:
+            try:
+                request = connection.recv()
+            except EOFError:
+                break
+
+            if request is None:
+                break
+
+            prompt = request["prompt"]
+            image_bytes = request["image_bytes"]
+            try:
+                response = {
+                    "ok": True,
+                    "value": _score_with_lmstudio_request(
+                        model=model,
+                        base_url=base_url,
+                        prompt=prompt,
+                        image_bytes=image_bytes,
+                        think=think,
+                        max_tokens=max_tokens,
+                        timeout_seconds=timeout_seconds,
+                    ),
+                }
+            except (json.JSONDecodeError, KeyError, OSError, TimeoutError, ValueError) as exc:
+                response = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+            try:
+                connection.send(response)
+            except (BrokenPipeError, EOFError, OSError):
+                break
+    finally:
+        connection.close()
 
 
-def default_device() -> str:
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
-
-
-def torch_dtype_for_device(device: str) -> torch.dtype:
-    if device == "cuda":
-        return torch.bfloat16
-    if device == "mps":
-        return torch.float16
-    return torch.float32
-
-
-def read_json(path: Path) -> object:
-    return json.loads(path.read_text())
-
-
-def write_json(path: Path, payload: object) -> None:
-    path.write_text(json.dumps(payload, indent=2))
-
-
-def load_dataset_manifest(path: Path) -> list[DatasetManifestEntry]:
-    raw = read_json(path)
-    rows = raw["datasets"] if isinstance(raw, dict) else raw
-    entries: list[DatasetManifestEntry] = []
-    for row in rows:
-        root = None if row.get("root") is None else Path(row["root"])
-        entries.append(
-            DatasetManifestEntry(
-                repo_id=row["repo_id"],
-                dataset_family=row.get("dataset_family", "custom"),
-                split=row.get("split", "train"),
-                root=root,
-                episode_from=int(row.get("episode_from", 0)),
-                episode_to=None if row.get("episode_to") is None else int(row["episode_to"]),
-                derived_label=None
-                if row.get("derived_label") is None
-                else int(row["derived_label"]),
-                label_rule=None if row.get("label_rule") is None else str(row["label_rule"]),
-                use_for_training=bool(row.get("use_for_training", False)),
-                use_for_evaluation=bool(row.get("use_for_evaluation", False)),
-            )
-        )
-    return entries
-
-
-def select_hook_layer_indices(total_layers: int, num_layers: int = 3) -> list[int]:
-    middle_index = total_layers // 2
-    remaining_layers = total_layers - middle_index
-    step = max(1, remaining_layers // num_layers)
-    indices: list[int] = []
-    for classifier_index in range(num_layers):
-        if classifier_index == num_layers - 1:
-            indices.append(total_layers - 1)
-        else:
-            indices.append(min(middle_index + classifier_index * step, total_layers - 1))
-    return indices
-
-
-class VLMFeatureExtractor:
+class BaseVLMScorer:
     def __init__(
         self,
-        vlm_model_id: str,
-        device: str | None = None,
-        hook_layer_indices: list[int] | None = None,
+        border_size: int = DEFAULT_BORDER_SIZE,
+        max_image_side: int | None = DEFAULT_MAX_IMAGE_SIDE,
+        timeout_seconds: float = DEFAULT_EXECUTION_TIMEOUT_SECONDS,
     ) -> None:
-        self.vlm_model_id = vlm_model_id
-        self.device = torch.device(default_device() if device is None else device)
-        self.dtype = torch_dtype_for_device(self.device.type)
-        self.processor = AutoProcessor.from_pretrained(BASE_MODEL_ID)
+        self.border_size = border_size
+        self.max_image_side = max_image_side
+        self.timeout_seconds = timeout_seconds
+        self._ctx = mp.get_context("spawn")
+        self._worker_process = None
+        self._worker_connection = None
+        self._worker_target = None
+        self._worker_args: tuple = ()
+        self._backend_name = "backend"
 
-        base_model = PaliGemmaForConditionalGeneration.from_pretrained(
-            BASE_MODEL_ID,
-            torch_dtype=self.dtype,
+    def _configure_worker(self, backend_name: str, worker_target, worker_args: tuple) -> None:
+        self._backend_name = backend_name
+        self._worker_target = worker_target
+        self._worker_args = worker_args
+
+    def warmup(self) -> None:
+        self._ensure_worker()
+
+    def close(self) -> None:
+        self._stop_worker(graceful=True)
+
+    def _ensure_worker(self) -> None:
+        if self._worker_process is not None and self._worker_process.is_alive():
+            return
+        if self._worker_target is None:
+            raise ExecutionBackendError(f"{self._backend_name} worker is not configured")
+
+        parent_connection, child_connection = self._ctx.Pipe()
+        process = self._ctx.Process(
+            target=self._worker_target,
+            args=(*self._worker_args, child_connection),
         )
-        self.model = PeftModel.from_pretrained(base_model, vlm_model_id)
-        self.model.to(self.device)
-        self.model.eval()
-        for parameter in self.model.parameters():
-            parameter.requires_grad = False
+        process.start()
+        child_connection.close()
+        self._worker_connection = parent_connection
+        self._worker_process = process
 
-        layers = self._find_language_model_layers()
-        if hook_layer_indices is None:
-            self.hook_layer_indices = select_hook_layer_indices(len(layers))
-        else:
-            self.hook_layer_indices = hook_layer_indices
+    def _stop_worker(self, graceful: bool) -> None:
+        process = self._worker_process
+        connection = self._worker_connection
+        self._worker_process = None
+        self._worker_connection = None
 
-        self.layer_features: dict[int, torch.Tensor] = {}
-        self.hook_handles: list[torch.utils.hooks.RemovableHandle] = []
-        for feature_index, layer_index in enumerate(self.hook_layer_indices):
-            target_layer = layers[layer_index]
+        if process is None:
+            if connection is not None:
+                connection.close()
+            return
 
-            def hook_fn(
-                module: nn.Module,
-                inputs: tuple[torch.Tensor, ...],
-                output: torch.Tensor | tuple[torch.Tensor, ...],
-                feature_slot: int = feature_index,
-            ) -> None:
-                if isinstance(output, tuple):
-                    self.layer_features[feature_slot] = output[0].detach()
-                else:
-                    self.layer_features[feature_slot] = output.detach()
+        if graceful and connection is not None and process.is_alive():
+            try:
+                connection.send(None)
+            except (BrokenPipeError, EOFError, OSError):
+                pass
 
-            self.hook_handles.append(target_layer.register_forward_hook(hook_fn))
+        if connection is not None:
+            connection.close()
 
-    def _find_language_model_layers(self) -> nn.ModuleList:
-        model_root = self.model.base_model.model.model
-        if hasattr(model_root, "language_model"):
-            language_model = model_root.language_model
-            if hasattr(language_model, "model") and hasattr(language_model.model, "layers"):
-                return language_model.model.layers
-            if hasattr(language_model, "layers"):
-                return language_model.layers
-        if hasattr(model_root, "layers"):
-            return model_root.layers
-        raise RuntimeError("Could not locate language-model layers in the adapter-backed VLM")
+        process.join(1 if graceful else 0)
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
 
-    def extract_episode_features(
+    def _call_worker(self, request: dict) -> dict:
+        self._ensure_worker()
+        if self._worker_connection is None:
+            raise ExecutionBackendError(f"{self._backend_name} worker is unavailable")
+
+        try:
+            self._worker_connection.send(request)
+            has_result = self._worker_connection.poll(self.timeout_seconds)
+        except KeyboardInterrupt:
+            self._stop_worker(graceful=False)
+            raise
+        except (BrokenPipeError, EOFError, OSError) as exc:
+            self._stop_worker(graceful=False)
+            raise ExecutionBackendError(f"{self._backend_name} worker failed: {exc}") from exc
+
+        if not has_result:
+            self._stop_worker(graceful=False)
+            raise ExecutionBackendTimeoutError(
+                f"{self._backend_name} request exceeded {self.timeout_seconds:.1f}s"
+            )
+
+        try:
+            result = self._worker_connection.recv()
+        except KeyboardInterrupt:
+            self._stop_worker(graceful=False)
+            raise
+        except (BrokenPipeError, EOFError, OSError) as exc:
+            self._stop_worker(graceful=False)
+            raise ExecutionBackendError(f"{self._backend_name} worker failed: {exc}") from exc
+
+        if not result["ok"]:
+            raise ExecutionBackendError(f"{self._backend_name} request failed: {result['error']}")
+        return result["value"]
+
+    def _prepare_image(self, image: Image.Image) -> Image.Image:
+        if self.max_image_side is None:
+            return image
+
+        width, height = image.size
+        largest_side = max(width, height)
+        if largest_side <= self.max_image_side:
+            return image
+
+        scale = self.max_image_side / largest_side
+        resized_width = max(1, round(width * scale))
+        resized_height = max(1, round(height * scale))
+        return image.resize((resized_width, resized_height), Image.Resampling.LANCZOS)
+
+    def _select_camera(self, episode: EpisodeRecord, camera_key: str | None) -> str:
+        camera_keys = list(episode.cameras.keys())
+        if camera_key:
+            if camera_key not in camera_keys:
+                raise ValueError(f"Camera key '{camera_key}' not found. Available: {camera_keys}")
+            return camera_key
+
+        preferred_order = {"observation.images.top": 0, "observation.images.wrist": 1}
+        camera_keys_sorted = sorted(camera_keys, key=lambda key: preferred_order.get(key, 99))
+        return camera_keys_sorted[0]
+
+    def _get_stitched_image(
         self,
         episode: EpisodeRecord,
-        frames_per_camera: int,
-    ) -> tuple[list[torch.Tensor], str | None]:
-        images: list[Image.Image] = []
-        for camera_key in episode.cameras:
-            frames = sample_segment_frames(episode.cameras[camera_key], frames_per_camera)
-            images.extend(Image.fromarray(frame) for frame in frames)
+        selected_camera: str,
+        pre_extracted: dict[str, Image.Image] | None,
+    ) -> Image.Image:
+        if pre_extracted and selected_camera in pre_extracted:
+            return pre_extracted[selected_camera]
 
-        prompt = build_prompt(images, episode.task)
-        model_inputs = self.processor(
-            text=[prompt],
-            images=[images],
-            return_tensors="pt",
-            padding="longest",
-        ).to(self.device)
+        video_segment = episode.cameras[selected_camera]
+        frames = sample_episode_frames(video_segment, DEFAULT_FRAMES_PER_EPISODE)
+        stitched_image = stitch_frames(frames, self.border_size)
+        return self._prepare_image(stitched_image)
 
-        self.layer_features.clear()
-        with torch.no_grad():
-            outputs = self.model(**model_inputs)
-
-        if len(self.layer_features) != len(self.hook_layer_indices):
-            raise RuntimeError(
-                f"Expected {len(self.hook_layer_indices)} hooked feature tensors, "
-                f"got {len(self.layer_features)}"
-            )
-
-        last_token_logits = outputs.logits[:, -1, :]
-        predicted_token_id = torch.argmax(last_token_logits, dim=-1)
-        decoded_vote = self.processor.decode(
-            [int(predicted_token_id[0].item())], skip_special_tokens=True
+    def _build_prompt(self, task: str) -> str:
+        return (
+            "The image shows 4 frames from a robot episode arranged in a 2x2 grid "
+            "(top-left: start, top-right: ~33% progress, bottom-left: ~67% progress, "
+            "bottom-right: end).\n"
+            "Does this image show a successful execution of the following task?\n"
+            f'Task: "{task}"\n\n'
+            "Answer with 'yes' or 'no'."
         )
 
-        features = [
-            self.layer_features[index][0].to(torch.float32).cpu()
-            for index in range(len(self.hook_layer_indices))
-        ]
-        return features, decoded_vote
+    def _encode_image(self, image: Image.Image) -> bytes:
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=85)
+        return buffer.getvalue()
 
-    def cleanup(self) -> None:
-        for handle in self.hook_handles:
-            handle.remove()
-        self.hook_handles.clear()
-        self.layer_features.clear()
-        if self.device.type == "cuda":
-            torch.cuda.empty_cache()
-        if self.device.type == "mps":
-            torch.mps.empty_cache()
+    def pre_extract_frames_for_episode(self, episode: EpisodeRecord) -> dict[str, Image.Image]:
+        pre_extracted = {}
+        for camera_key, video_segment in episode.cameras.items():
+            frames = sample_episode_frames(video_segment, DEFAULT_FRAMES_PER_EPISODE)
+            stitched_image = stitch_frames(frames, self.border_size)
+            pre_extracted[camera_key] = self._prepare_image(stitched_image)
+        return pre_extracted
 
 
-class AttentionPooling(nn.Module):
-    def __init__(self, feature_dim: int, hidden_dim: int) -> None:
-        super().__init__()
-        self.attention = nn.Sequential(
-            nn.Linear(feature_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def forward(self, features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        scores = self.attention(features).squeeze(-1)
-        scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
-        weights = torch.softmax(scores, dim=1).unsqueeze(-1)
-        return torch.sum(weights * features, dim=1)
-
-
-class FrozenVLMProbeHead(nn.Module):
+class OllamaVLMScorer(BaseVLMScorer):
     def __init__(
         self,
-        feature_dim: int,
-        num_layers: int,
-        hidden_dim: int = 512,
-        dropout_rate: float = 0.3,
+        model: str = DEFAULT_OLLAMA_MODEL,
+        host: str = DEFAULT_OLLAMA_HOST,
+        border_size: int = DEFAULT_BORDER_SIZE,
+        think: bool = False,
+        keep_alive: float = 5 * 60.0,
+        max_image_side: int | None = DEFAULT_MAX_IMAGE_SIDE,
+        timeout_seconds: float = DEFAULT_EXECUTION_TIMEOUT_SECONDS,
     ) -> None:
-        super().__init__()
-        self.feature_dim = feature_dim
-        self.num_layers = num_layers
-        self.hidden_dim = hidden_dim
-        self.dropout_rate = dropout_rate
-
-        self.poolers = nn.ModuleList(
-            AttentionPooling(feature_dim=feature_dim, hidden_dim=hidden_dim)
-            for _ in range(num_layers)
+        super().__init__(
+            border_size=border_size,
+            max_image_side=max_image_side,
+            timeout_seconds=timeout_seconds,
         )
-        self.classifiers = nn.ModuleList(
-            nn.Sequential(
-                nn.LayerNorm(feature_dim),
-                nn.Linear(feature_dim, hidden_dim),
-                nn.GELU(),
-                nn.Dropout(dropout_rate),
-                nn.Linear(hidden_dim, 1),
-            )
-            for _ in range(num_layers)
+        self.model = model
+        self.host = host
+        self.think = think
+        self.keep_alive = keep_alive
+        self._configure_worker(
+            backend_name="Ollama",
+            worker_target=_ollama_worker_loop,
+            worker_args=(self.model, self.host, self.think, self.keep_alive),
         )
 
-    def forward(self, layer_features: list[torch.Tensor], mask: torch.Tensor) -> torch.Tensor:
-        if len(layer_features) != self.num_layers:
-            raise ValueError(
-                f"Expected {self.num_layers} feature tensors, got {len(layer_features)}"
-            )
+    def score_episode(
+        self,
+        episode: EpisodeRecord,
+        camera_key: str | None = None,
+        pre_extracted: dict[str, Image.Image] | None = None,
+    ) -> dict:
+        selected_camera = self._select_camera(episode, camera_key)
+        stitched_image = self._get_stitched_image(episode, selected_camera, pre_extracted)
+        prompt = self._build_prompt(episode.task)
+        image_bytes = self._encode_image(stitched_image)
+        result = self._call_worker({"prompt": prompt, "image_bytes": image_bytes})
 
-        logits: list[torch.Tensor] = []
-        for layer_index, features in enumerate(layer_features):
-            pooled = self.poolers[layer_index](features, mask)
-            logits.append(self.classifiers[layer_index](pooled).squeeze(-1))
-        return torch.stack(logits, dim=1)
-
-
-class LogitCalibrator(nn.Module):
-    def __init__(self, scale: float = 1.0, bias: float = 0.0) -> None:
-        super().__init__()
-        self.scale = nn.Parameter(torch.tensor(scale, dtype=torch.float32))
-        self.bias = nn.Parameter(torch.tensor(bias, dtype=torch.float32))
-
-    def forward(self, logits: torch.Tensor) -> torch.Tensor:
-        return self.scale * logits + self.bias
-
-    def fit(self, logits: torch.Tensor, labels: torch.Tensor) -> None:
-        optimizer = torch.optim.LBFGS(self.parameters(), max_iter=50, line_search_fn="strong_wolfe")
-        criterion = nn.BCEWithLogitsLoss()
-
-        def closure() -> torch.Tensor:
-            optimizer.zero_grad()
-            loss = criterion(self(logits), labels)
-            loss.backward()
-            return loss
-
-        optimizer.step(closure)
-
-
-class CachedFeatureDataset(Dataset[tuple[list[torch.Tensor], FeatureIndexEntry]]):
-    def __init__(self, feature_dir: Path, entries: list[FeatureIndexEntry]) -> None:
-        self.feature_dir = feature_dir
-        self.entries = entries
-
-    def __len__(self) -> int:
-        return len(self.entries)
-
-    def __getitem__(self, index: int) -> tuple[list[torch.Tensor], FeatureIndexEntry]:
-        entry = self.entries[index]
-        payload = torch.load(self.feature_dir / entry.feature_path, map_location="cpu")
-        layer_features = [tensor.to(torch.float32) for tensor in payload["layer_features"]]
-        return layer_features, entry
-
-
-class FrozenVLMProbeExecutionScorer:
-    def __init__(self, checkpoint: ExecutionCheckpoint, device: str | None = None) -> None:
-        self.checkpoint = checkpoint
-        self.device = torch.device(default_device() if device is None else device)
-        self.extractor = VLMFeatureExtractor(
-            vlm_model_id=checkpoint.vlm_model_id,
-            device=self.device.type,
-            hook_layer_indices=checkpoint.hook_layer_indices,
-        )
-        self.head = FrozenVLMProbeHead(
-            feature_dim=checkpoint.feature_dim,
-            num_layers=len(checkpoint.hook_layer_indices),
-            hidden_dim=checkpoint.hidden_dim,
-            dropout_rate=checkpoint.dropout_rate,
-        )
-        self.head.load_state_dict(checkpoint.head_state_dict)
-        self.head.to(self.device)
-        self.head.eval()
-        self.calibrator = LogitCalibrator(
-            scale=checkpoint.calibration_scale,
-            bias=checkpoint.calibration_bias,
-        ).to(self.device)
-        self.calibrator.eval()
-
-    def score_episode(self, episode: EpisodeRecord) -> ExecutionResult:
-        layer_features, decoded_vote = self.extractor.extract_episode_features(
-            episode=episode,
-            frames_per_camera=self.checkpoint.frames_per_camera,
-        )
-        tensors = [feature.unsqueeze(0).to(self.device) for feature in layer_features]
-        mask = torch.ones((1, layer_features[0].shape[0]), dtype=torch.bool, device=self.device)
-        with torch.no_grad():
-            layer_logits = self.head(tensors, mask)
-            mean_logits = layer_logits.mean(dim=1)
-            calibrated_logits = self.calibrator(mean_logits)
-            probability = float(torch.sigmoid(calibrated_logits)[0].item())
-
-        return ExecutionResult(
-            score=probability,
-            probability=probability,
-            decoded_vote=decoded_vote,
-        )
-
-    def cleanup(self) -> None:
-        self.extractor.cleanup()
-
-
-def save_feature_cache_index(output_dir: Path, index: FeatureCacheIndex) -> None:
-    payload = {
-        "version": index.version,
-        "vlm_model_id": index.vlm_model_id,
-        "camera_keys": index.camera_keys,
-        "frames_per_camera": index.frames_per_camera,
-        "hook_layer_indices": index.hook_layer_indices,
-        "feature_dim": index.feature_dim,
-        "records": [feature_index_entry_to_json(entry) for entry in index.records],
-    }
-    write_json(output_dir / "index.json", payload)
-
-
-def load_feature_cache_index(feature_dir: Path) -> FeatureCacheIndex:
-    raw = read_json(feature_dir / "index.json")
-    records = [feature_index_entry_from_json(row) for row in raw["records"]]
-    return FeatureCacheIndex(
-        version=int(raw["version"]),
-        vlm_model_id=str(raw["vlm_model_id"]),
-        camera_keys=[str(camera_key) for camera_key in raw["camera_keys"]],
-        frames_per_camera=int(raw["frames_per_camera"]),
-        hook_layer_indices=[int(index) for index in raw["hook_layer_indices"]],
-        feature_dim=int(raw["feature_dim"]),
-        records=records,
-    )
-
-
-def feature_index_entry_to_json(entry: FeatureIndexEntry) -> dict[str, object]:
-    return {
-        "feature_path": entry.feature_path,
-        "repo_id": entry.repo_id,
-        "dataset_family": entry.dataset_family,
-        "split": entry.split,
-        "use_for_training": entry.use_for_training,
-        "use_for_evaluation": entry.use_for_evaluation,
-        "episode_index": entry.episode_index,
-        "task": entry.task,
-        "label": entry.label,
-        "quality_score": entry.quality_score,
-        "decoded_vote": entry.decoded_vote,
-        "num_tokens": entry.num_tokens,
-    }
-
-
-def feature_index_entry_from_json(row: dict[str, object]) -> FeatureIndexEntry:
-    label_value = row["label"]
-    label = None if label_value is None else int(label_value)
-    decoded_vote_value = row["decoded_vote"]
-    decoded_vote = None if decoded_vote_value is None else str(decoded_vote_value)
-    return FeatureIndexEntry(
-        feature_path=str(row["feature_path"]),
-        repo_id=str(row["repo_id"]),
-        dataset_family=str(row["dataset_family"]),
-        split=str(row["split"]),
-        use_for_training=bool(row["use_for_training"]),
-        use_for_evaluation=bool(row["use_for_evaluation"]),
-        episode_index=int(row["episode_index"]),
-        task=str(row["task"]),
-        label=label,
-        quality_score=float(row["quality_score"]),
-        decoded_vote=decoded_vote,
-        num_tokens=int(row["num_tokens"]),
-    )
-
-
-def save_execution_checkpoint(
-    path: Path,
-    head: FrozenVLMProbeHead,
-    cache_index: FeatureCacheIndex,
-    calibrator: LogitCalibrator,
-    threshold: float,
-) -> None:
-    checkpoint = {
-        "backend_name": "frozen_vlm_probe",
-        "backend_version": 1,
-        "vlm_model_id": cache_index.vlm_model_id,
-        "camera_keys": cache_index.camera_keys,
-        "frames_per_camera": cache_index.frames_per_camera,
-        "hook_layer_indices": cache_index.hook_layer_indices,
-        "feature_dim": cache_index.feature_dim,
-        "hidden_dim": head.hidden_dim,
-        "dropout_rate": head.dropout_rate,
-        "threshold": threshold,
-        "calibration_scale": float(calibrator.scale.detach().cpu().item()),
-        "calibration_bias": float(calibrator.bias.detach().cpu().item()),
-        "label_mapping": {"fail": 0, "success": 1},
-        "head_state_dict": {key: value.detach().cpu() for key, value in head.state_dict().items()},
-    }
-    torch.save(checkpoint, path)
-
-
-def load_execution_checkpoint(path: Path) -> ExecutionCheckpoint:
-    raw = torch.load(path, map_location="cpu")
-    return ExecutionCheckpoint(
-        checkpoint_path=path,
-        backend_name=str(raw["backend_name"]),
-        backend_version=int(raw["backend_version"]),
-        vlm_model_id=str(raw["vlm_model_id"]),
-        camera_keys=[str(camera_key) for camera_key in raw["camera_keys"]],
-        frames_per_camera=int(raw["frames_per_camera"]),
-        hook_layer_indices=[int(index) for index in raw["hook_layer_indices"]],
-        feature_dim=int(raw["feature_dim"]),
-        hidden_dim=int(raw["hidden_dim"]),
-        dropout_rate=float(raw["dropout_rate"]),
-        threshold=float(raw["threshold"]),
-        calibration_scale=float(raw["calibration_scale"]),
-        calibration_bias=float(raw["calibration_bias"]),
-        label_mapping={str(key): int(value) for key, value in raw["label_mapping"].items()},
-        head_state_dict={
-            str(key): value.to(torch.float32) for key, value in raw["head_state_dict"].items()
-        },
-    )
-
-
-def filter_entries_for_training(
-    index: FeatureCacheIndex,
-) -> tuple[list[FeatureIndexEntry], list[FeatureIndexEntry]]:
-    labeled_entries = [entry for entry in index.records if entry.label is not None]
-    train_entries = [
-        entry for entry in labeled_entries if entry.use_for_training and entry.split == "train"
-    ]
-    val_entries = [
-        entry for entry in labeled_entries if entry.use_for_training and entry.split == "val"
-    ]
-    if not train_entries:
-        raise ValueError(
-            "No labeled training entries with split='train' were found in the feature cache"
-        )
-    if not val_entries:
-        raise ValueError(
-            "No labeled validation entries with split='val' were found in the feature cache"
-        )
-    return train_entries, val_entries
-
-
-def filter_entries_for_evaluation(index: FeatureCacheIndex) -> list[FeatureIndexEntry]:
-    labeled_entries = [
-        entry for entry in index.records if entry.label is not None and entry.use_for_evaluation
-    ]
-    if labeled_entries:
-        return labeled_entries
-    fallback_entries = [
-        entry for entry in index.records if entry.label is not None and entry.split == "test"
-    ]
-    if fallback_entries:
-        return fallback_entries
-    raise ValueError("No labeled evaluation entries were found in the feature cache")
-
-
-def collate_feature_batch(
-    batch: list[tuple[list[torch.Tensor], FeatureIndexEntry]],
-) -> FeatureBatch:
-    if not batch:
-        raise ValueError("Feature batch cannot be empty")
-
-    num_layers = len(batch[0][0])
-    max_tokens = max(features[0].shape[0] for features, _ in batch)
-    feature_dim = batch[0][0][0].shape[1]
-    mask = torch.zeros((len(batch), max_tokens), dtype=torch.bool)
-    layer_features = [
-        torch.zeros((len(batch), max_tokens, feature_dim), dtype=torch.float32)
-        for _ in range(num_layers)
-    ]
-    labels = torch.zeros(len(batch), dtype=torch.float32)
-    entries: list[FeatureIndexEntry] = []
-
-    for batch_index, (features, entry) in enumerate(batch):
-        token_count = features[0].shape[0]
-        mask[batch_index, :token_count] = True
-        for layer_index in range(num_layers):
-            layer_features[layer_index][batch_index, :token_count] = features[layer_index]
-        if entry.label is None:
-            raise ValueError("Training and evaluation batches require explicit labels")
-        labels[batch_index] = float(entry.label)
-        entries.append(entry)
-
-    return FeatureBatch(layer_features=layer_features, mask=mask, labels=labels, entries=entries)
-
-
-def create_feature_loader(
-    feature_dir: Path,
-    entries: list[FeatureIndexEntry],
-    batch_size: int,
-    shuffle: bool,
-) -> DataLoader[tuple[list[torch.Tensor], FeatureIndexEntry]]:
-    dataset = CachedFeatureDataset(feature_dir=feature_dir, entries=entries)
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        collate_fn=collate_feature_batch,
-    )
-
-
-def run_head_on_loader(
-    loader: DataLoader[FeatureBatch],
-    head: FrozenVLMProbeHead,
-    calibrator: LogitCalibrator | None,
-    device: torch.device,
-) -> tuple[list[float], list[int], list[FeatureIndexEntry], list[float]]:
-    probabilities: list[float] = []
-    labels: list[int] = []
-    entries: list[FeatureIndexEntry] = []
-    raw_logits: list[float] = []
-
-    head.eval()
-    with torch.no_grad():
-        for batch in loader:
-            layer_features = [feature.to(device) for feature in batch.layer_features]
-            mask = batch.mask.to(device)
-            layer_logits = head(layer_features, mask)
-            mean_logits = layer_logits.mean(dim=1)
-            logits = mean_logits if calibrator is None else calibrator(mean_logits)
-            probabilities.extend(torch.sigmoid(logits).cpu().tolist())
-            raw_logits.extend(mean_logits.cpu().tolist())
-            labels.extend(int(label) for label in batch.labels.tolist())
-            entries.extend(batch.entries)
-
-    return probabilities, labels, entries, raw_logits
-
-
-def fit_execution_head(
-    feature_dir: Path,
-    batch_size: int,
-    num_epochs: int,
-    learning_rate: float,
-    weight_decay: float,
-    hidden_dim: int,
-    dropout_rate: float,
-    threshold: float,
-    device: str | None = None,
-    on_epoch_end: Callable[[dict[str, object]], None] | None = None,
-) -> tuple[FeatureCacheIndex, FrozenVLMProbeHead, LogitCalibrator, dict[str, object]]:
-    cache_index = load_feature_cache_index(feature_dir)
-    train_entries, val_entries = filter_entries_for_training(cache_index)
-    train_loader = create_feature_loader(
-        feature_dir=feature_dir,
-        entries=train_entries,
-        batch_size=batch_size,
-        shuffle=True,
-    )
-    val_loader = create_feature_loader(
-        feature_dir=feature_dir,
-        entries=val_entries,
-        batch_size=batch_size,
-        shuffle=False,
-    )
-
-    torch_device = torch.device(default_device() if device is None else device)
-    head = FrozenVLMProbeHead(
-        feature_dim=cache_index.feature_dim,
-        num_layers=len(cache_index.hook_layer_indices),
-        hidden_dim=hidden_dim,
-        dropout_rate=dropout_rate,
-    ).to(torch_device)
-
-    positive_count = sum(entry.label == 1 for entry in train_entries)
-    negative_count = sum(entry.label == 0 for entry in train_entries)
-    if positive_count == 0 or negative_count == 0:
-        raise ValueError("Training requires both positive and negative labeled entries")
-
-    pos_weight = torch.tensor(
-        negative_count / positive_count,
-        dtype=torch.float32,
-        device=torch_device,
-    )
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = torch.optim.AdamW(
-        head.parameters(),
-        lr=learning_rate,
-        weight_decay=weight_decay,
-    )
-
-    best_state: dict[str, torch.Tensor] | None = None
-    best_metrics: dict[str, float | None] | None = None
-    best_score = float("-inf")
-    training_history: list[dict[str, float | None]] = []
-
-    for epoch in range(1, num_epochs + 1):
-        head.train()
-        total_loss = 0.0
-        total_examples = 0
-
-        for batch in train_loader:
-            layer_features = [feature.to(torch_device) for feature in batch.layer_features]
-            mask = batch.mask.to(torch_device)
-            labels = batch.labels.to(torch_device)
-
-            optimizer.zero_grad()
-            layer_logits = head(layer_features, mask)
-            expanded_labels = labels.unsqueeze(1).expand_as(layer_logits)
-            loss = criterion(layer_logits, expanded_labels)
-            loss.backward()
-            optimizer.step()
-
-            total_loss += float(loss.item()) * len(batch.entries)
-            total_examples += len(batch.entries)
-
-        val_probabilities, val_labels, _, val_logits = run_head_on_loader(
-            loader=val_loader,
-            head=head,
-            calibrator=None,
-            device=torch_device,
-        )
-        val_metrics = sanitized_metrics(
-            compute_binary_metrics(val_probabilities, val_labels, threshold)
-        )
-        epoch_metrics = {
-            "epoch": float(epoch),
-            "train_loss": total_loss / total_examples,
-            **val_metrics,
+        return {
+            **result,
+            "camera_used": selected_camera,
         }
-        training_history.append(epoch_metrics)
-        if on_epoch_end is not None:
-            on_epoch_end(
-                {
-                    "epoch": epoch,
-                    "train_count": len(train_entries),
-                    "val_count": len(val_entries),
-                    "positive_count": positive_count,
-                    "negative_count": negative_count,
-                    "metrics": epoch_metrics,
-                    "history": training_history,
-                }
-            )
 
-        comparison_score = (
-            float(val_metrics["auroc"])
-            if val_metrics["auroc"] is not None
-            else float(val_metrics["balanced_accuracy"] or 0.0)
+
+class LMStudioVLMScorer(BaseVLMScorer):
+    def __init__(
+        self,
+        model: str = DEFAULT_LMSTUDIO_MODEL,
+        base_url: str = DEFAULT_LMSTUDIO_BASE_URL,
+        border_size: int = DEFAULT_BORDER_SIZE,
+        think: bool = False,
+        max_image_side: int | None = DEFAULT_MAX_IMAGE_SIDE,
+        max_tokens: int = DEFAULT_LMSTUDIO_MAX_TOKENS,
+        timeout_seconds: float = DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+    ) -> None:
+        super().__init__(
+            border_size=border_size,
+            max_image_side=max_image_side,
+            timeout_seconds=timeout_seconds,
         )
-        if comparison_score > best_score:
-            best_score = comparison_score
-            best_metrics = val_metrics
-            best_state = {key: value.detach().cpu() for key, value in head.state_dict().items()}
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.think = think
+        self.max_tokens = max_tokens
+        self._configure_worker(
+            backend_name="LM Studio",
+            worker_target=_lmstudio_worker_loop,
+            worker_args=(
+                self.model,
+                self.base_url,
+                self.think,
+                self.max_tokens,
+                self.timeout_seconds,
+            ),
+        )
 
-    if best_state is None or best_metrics is None:
-        raise RuntimeError("Training did not produce a checkpointable execution head")
-
-    head.load_state_dict(best_state)
-    best_val_probabilities, best_val_labels, _, best_val_logits = run_head_on_loader(
-        loader=val_loader,
-        head=head,
-        calibrator=None,
-        device=torch_device,
-    )
-    calibrator = LogitCalibrator()
-    calibration_logits = torch.tensor(best_val_logits, dtype=torch.float32)
-    calibration_labels = torch.tensor(best_val_labels, dtype=torch.float32)
-    calibrator.fit(calibration_logits, calibration_labels)
-
-    calibrated_probabilities = torch.sigmoid(calibrator(calibration_logits)).tolist()
-    calibrated_metrics = sanitized_metrics(
-        compute_binary_metrics(calibrated_probabilities, val_labels, threshold)
-    )
-    metrics = {
-        "threshold": threshold,
-        "train_count": len(train_entries),
-        "val_count": len(val_entries),
-        "best_uncalibrated_val_probabilities_mean": sum(best_val_probabilities)
-        / len(best_val_probabilities),
-        "best_uncalibrated_val_metrics": best_metrics,
-        "calibrated_val_metrics": calibrated_metrics,
-        "history": training_history,
-    }
-    return cache_index, head.cpu(), calibrator.cpu(), metrics
-
-
-def evaluate_execution_checkpoint(
-    feature_dir: Path,
-    checkpoint: ExecutionCheckpoint,
-    batch_size: int,
-    device: str | None = None,
-) -> tuple[list[dict[str, object]], dict[str, object]]:
-    cache_index = load_feature_cache_index(feature_dir)
-    eval_entries = filter_entries_for_evaluation(cache_index)
-    loader = create_feature_loader(
-        feature_dir=feature_dir,
-        entries=eval_entries,
-        batch_size=batch_size,
-        shuffle=False,
-    )
-
-    torch_device = torch.device(default_device() if device is None else device)
-    head = FrozenVLMProbeHead(
-        feature_dim=checkpoint.feature_dim,
-        num_layers=len(checkpoint.hook_layer_indices),
-        hidden_dim=checkpoint.hidden_dim,
-        dropout_rate=checkpoint.dropout_rate,
-    ).to(torch_device)
-    head.load_state_dict(checkpoint.head_state_dict)
-    calibrator = LogitCalibrator(
-        scale=checkpoint.calibration_scale,
-        bias=checkpoint.calibration_bias,
-    ).to(torch_device)
-
-    execution_probabilities, labels, entries, _ = run_head_on_loader(
-        loader=loader,
-        head=head,
-        calibrator=calibrator,
-        device=torch_device,
-    )
-
-    rows: list[dict[str, object]] = []
-    quality_probabilities: list[float] = []
-    vlm_vote_probabilities: list[float] = []
-    for entry, label, execution_probability in zip(
-        entries, labels, execution_probabilities, strict=True
-    ):
-        decoded_vote_label = decode_vote_to_label(entry.decoded_vote)
-        decoded_vote_probability = 0.5 if decoded_vote_label is None else float(decoded_vote_label)
-        quality_probabilities.append(entry.quality_score)
-        vlm_vote_probabilities.append(decoded_vote_probability)
-        rows.append(
+    def score_episode(
+        self,
+        episode: EpisodeRecord,
+        camera_key: str | None = None,
+        pre_extracted: dict[str, Image.Image] | None = None,
+    ) -> dict:
+        selected_camera = self._select_camera(episode, camera_key)
+        stitched_image = self._get_stitched_image(episode, selected_camera, pre_extracted)
+        image_bytes = self._encode_image(stitched_image)
+        result = self._call_worker(
             {
-                "repo_id": entry.repo_id,
-                "dataset_family": entry.dataset_family,
-                "split": entry.split,
-                "episode_index": entry.episode_index,
-                "task": entry.task,
-                "label": label,
-                "execution_probability": execution_probability,
-                "predicted_label": int(execution_probability >= checkpoint.threshold),
-                "quality_score": entry.quality_score,
-                "decoded_vote": entry.decoded_vote,
-                "decoded_vote_probability": decoded_vote_probability,
+                "prompt": self._build_prompt(episode.task),
+                "image_bytes": image_bytes,
             }
         )
 
-    execution_metrics = sanitized_metrics(
-        compute_binary_metrics(execution_probabilities, labels, checkpoint.threshold)
-    )
-    quality_metrics = sanitized_metrics(
-        compute_binary_metrics(quality_probabilities, labels, DEFAULT_THRESHOLD)
-    )
-    constant_positive_metrics = sanitized_metrics(
-        compute_binary_metrics([1.0] * len(labels), labels, DEFAULT_THRESHOLD)
-    )
-    vlm_vote_metrics = sanitized_metrics(
-        compute_binary_metrics(vlm_vote_probabilities, labels, DEFAULT_THRESHOLD)
-    )
-
-    family_summaries: dict[str, dict[str, object]] = {}
-    families = sorted({entry.dataset_family for entry in entries})
-    for family in families:
-        family_rows = [row for row in rows if row["dataset_family"] == family]
-        family_labels = [int(row["label"]) for row in family_rows]
-        family_execution = [float(row["execution_probability"]) for row in family_rows]
-        family_quality = [float(row["quality_score"]) for row in family_rows]
-        family_summaries[family] = {
-            "count": len(family_rows),
-            "execution_metrics": sanitized_metrics(
-                compute_binary_metrics(family_execution, family_labels, checkpoint.threshold)
-            ),
-            "quality_metrics": sanitized_metrics(
-                compute_binary_metrics(family_quality, family_labels, DEFAULT_THRESHOLD)
-            ),
+        return {
+            **result,
+            "camera_used": selected_camera,
         }
-
-    summary = {
-        "backend_name": checkpoint.backend_name,
-        "checkpoint_path": str(checkpoint.checkpoint_path),
-        "vlm_model_id": checkpoint.vlm_model_id,
-        "camera_keys": checkpoint.camera_keys,
-        "frames_per_camera": checkpoint.frames_per_camera,
-        "threshold": checkpoint.threshold,
-        "count": len(rows),
-        "execution_metrics": execution_metrics,
-        "quality_only_baseline_metrics": quality_metrics,
-        "constant_positive_baseline_metrics": constant_positive_metrics,
-        "decoded_vote_baseline_metrics": vlm_vote_metrics,
-        "dataset_family_summaries": family_summaries,
-    }
-    return rows, summary
-
-
-def default_camera_keys_for_backend(
-    requested_camera_keys: list[str],
-    checkpoint: ExecutionCheckpoint | None,
-) -> list[str]:
-    if requested_camera_keys:
-        return requested_camera_keys
-    if checkpoint is not None:
-        return checkpoint.camera_keys
-    return []
