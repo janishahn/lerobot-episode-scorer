@@ -19,6 +19,7 @@ from lerobot_episode_scorer.execution import (
 )
 from lerobot_episode_scorer.output import RollingOutputWriter
 from lerobot_episode_scorer.quality import EpisodeQualityScorer
+from lerobot_episode_scorer.video import VideoValidationError, validate_video
 
 SAVE_EPISODE_SAMPLE_COUNT = 20
 SAVE_FRAMES_DIR = "saved_frames"
@@ -161,6 +162,24 @@ def main() -> None:
         print(f"Using Ollama VLM scorer with model {args.ollama_model}")
 
     if execution_scorer is not None:
+        print("Validating video files for all episodes...")
+        validation_errors: list[tuple[int, str, str]] = []
+        for episode in tqdm(loaded_dataset.episodes, desc="Validating videos", unit="episode"):
+            for camera_key, video_segment in episode.cameras.items():
+                try:
+                    validate_video(video_segment)
+                except VideoValidationError as e:
+                    validation_errors.append((episode.episode_index, camera_key, str(e)))
+
+        if validation_errors:
+            print(f"\nFound {len(validation_errors)} video validation errors:")
+            for episode_idx, camera, error in validation_errors[:10]:
+                print(f"  Episode {episode_idx} ({camera}): {error}")
+            if len(validation_errors) > 10:
+                print(f"  ... and {len(validation_errors) - 10} more errors")
+            print("\nPlease fix the video files or re-download the dataset before proceeding.")
+            return
+
         print("Pre-extracting frames for all episodes...")
         for episode in tqdm(loaded_dataset.episodes, desc="Extracting frames", unit="episode"):
             start_time = time.time()

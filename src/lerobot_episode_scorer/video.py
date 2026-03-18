@@ -5,11 +5,48 @@ import av
 import numpy as np
 
 
+class VideoValidationError(Exception):
+    """Raised when a video file fails pre-validation."""
+
+    pass
+
+
 @dataclass(frozen=True)
 class VideoSegment:
     video_path: Path
     from_timestamp: float
     to_timestamp: float
+
+
+def validate_video(segment: VideoSegment) -> None:
+    """Validate that a video segment can be opened and decoded.
+
+    Raises VideoValidationError if the file is missing, empty, corrupted,
+    or cannot be opened/decoded.
+    """
+    path = segment.video_path
+
+    if not path.exists():
+        raise VideoValidationError(f"Video file does not exist: {path}")
+
+    if path.stat().st_size == 0:
+        raise VideoValidationError(f"Video file is empty: {path}")
+
+    try:
+        with av.open(str(path)) as container:
+            if not container.streams.video:
+                raise VideoValidationError(f"No video stream found in: {path}")
+
+            stream = container.streams.video[0]
+            duration = float(stream.duration * stream.time_base) if stream.duration else None
+            if duration is not None and segment.to_timestamp > duration:
+                raise VideoValidationError(
+                    f"Segment end time {segment.to_timestamp}s exceeds video duration {duration}s: {path}"
+                )
+    except av.error.InvalidDataError as e:
+        raise VideoValidationError(f"Corrupted or invalid video file: {path}") from e
+    except av.error.UnsupportedError as e:
+        raise VideoValidationError(f"Unsupported video format: {path}") from e
 
 
 def _sample_frames_at_times(
