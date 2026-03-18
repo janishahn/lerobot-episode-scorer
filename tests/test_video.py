@@ -61,7 +61,7 @@ class VideoSamplingTests(TestCase):
             frames = sample_episode_frames(segment)
 
         self.assertEqual([int(frame[0, 0, 0]) for frame in frames], [2, 3, 4, 5])
-        self.assertEqual(container.stream.thread_type, "AUTO")
+        self.assertIsNone(container.stream.thread_type)
         self.assertEqual(container.seek_calls, [(300, container.stream, True)])
 
     def test_sample_segment_frames_seeks_before_sampling(self) -> None:

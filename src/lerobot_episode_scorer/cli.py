@@ -10,10 +10,13 @@ from tqdm import tqdm
 from lerobot_episode_scorer.dataset import load_lerobot_dataset
 from lerobot_episode_scorer.execution import (
     DEFAULT_BORDER_SIZE,
+    DEFAULT_EXECUTION_TIMEOUT_SECONDS,
     DEFAULT_LMSTUDIO_BASE_URL,
     DEFAULT_LMSTUDIO_MODEL,
     DEFAULT_OLLAMA_HOST,
     DEFAULT_OLLAMA_MODEL,
+    ExecutionBackendError,
+    ExecutionBackendTimeoutError,
     LMStudioVLMScorer,
     OllamaVLMScorer,
 )
@@ -114,6 +117,15 @@ def build_parser() -> argparse.ArgumentParser:
             "to disk for debugging."
         ),
     )
+    parser.add_argument(
+        "--execution-timeout-seconds",
+        type=float,
+        default=DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+        help=(
+            "Maximum time to wait for a single LM Studio or Ollama scoring request before "
+            "marking that episode's execution score as unknown."
+        ),
+    )
     return parser
 
 
@@ -147,6 +159,7 @@ def main() -> None:
             base_url=args.lmstudio_base_url,
             border_size=args.stitch_border_size,
             think=args.think,
+            timeout_seconds=args.execution_timeout_seconds,
         )
         execution_model = args.lmstudio_model
         print(f"Using LM Studio VLM scorer with model {args.lmstudio_model}")
@@ -157,11 +170,13 @@ def main() -> None:
             border_size=args.stitch_border_size,
             think=args.think,
             keep_alive=args.ollama_keep_alive,
+            timeout_seconds=args.execution_timeout_seconds,
         )
         execution_model = args.ollama_model
         print(f"Using Ollama VLM scorer with model {args.ollama_model}")
 
     if execution_scorer is not None:
+        execution_scorer.warmup()
         print("Validating video files for all episodes...")
         validation_errors: list[tuple[int, str, str]] = []
         for episode in tqdm(loaded_dataset.episodes, desc="Validating videos", unit="episode"):
@@ -189,6 +204,8 @@ def main() -> None:
             elapsed = time.time() - start_time
             logging.info(f"Frame extraction episode {episode.episode_index}: {elapsed:.2f}s")
 
+        print("Frame extraction complete.")
+
     if args.save_frames and pre_extracted_frames:
         frames_dir = args.output_dir / SAVE_FRAMES_DIR
         frames_dir.mkdir(parents=True, exist_ok=True)
@@ -208,6 +225,7 @@ def main() -> None:
                 stitched_image.save(filepath, "JPEG", quality=95)
                 logging.info("Saved frame: %s", filepath)
 
+    print("Starting episode scoring...")
     writer = RollingOutputWriter(
         output_dir=args.output_dir,
         execution_backend=args.execution_backend,
@@ -218,53 +236,71 @@ def main() -> None:
         dataset_family=args.dataset_family,
     )
 
-    for episode in tqdm(loaded_dataset.episodes, desc="Scoring episodes", unit="episode"):
-        start_time = time.time()
-        quality = quality_scorer.score_episode(episode)
+    try:
+        for episode in tqdm(loaded_dataset.episodes, desc="Scoring episodes", unit="episode"):
+            start_time = time.time()
+            quality = quality_scorer.score_episode(episode)
 
-        if execution_scorer is None:
-            execution_score = 1.0
-            execution_probability = 1.0
-            vlm_response = None
-            reasoning_trace = None
-            camera_used = loaded_dataset.camera_keys[0] if loaded_dataset.camera_keys else None
-        else:
-            result = execution_scorer.score_episode(
-                episode, pre_extracted=pre_extracted_frames.get(episode.episode_index)
+            if execution_scorer is None:
+                execution_score = 1.0
+                execution_probability = 1.0
+                vlm_response = None
+                reasoning_trace = None
+                camera_used = loaded_dataset.camera_keys[0] if loaded_dataset.camera_keys else None
+            else:
+                try:
+                    result = execution_scorer.score_episode(
+                        episode, pre_extracted=pre_extracted_frames.get(episode.episode_index)
+                    )
+                    execution_score = result["score"]
+                    execution_probability = result["probability"]
+                    vlm_response = result.get("raw_response")
+                    reasoning_trace = result.get("reasoning_trace")
+                    camera_used = result.get("camera_used")
+                except (ExecutionBackendError, ExecutionBackendTimeoutError) as e:
+                    execution_score = 0.5
+                    execution_probability = 0.5
+                    vlm_response = None
+                    reasoning_trace = str(e)
+                    camera_used = None
+                    logging.warning(
+                        "Execution scoring failed for episode %s: %s",
+                        episode.episode_index,
+                        e,
+                    )
+
+            elapsed = time.time() - start_time
+            logging.info(
+                f"Episode {episode.episode_index}: {elapsed:.2f}s - "
+                f"quality={quality['aggregate']:.3f}, execution={execution_score:.3f}"
             )
-            execution_score = result["score"]
-            execution_probability = result["probability"]
-            vlm_response = result.get("raw_response")
-            reasoning_trace = result.get("reasoning_trace")
-            camera_used = result.get("camera_used")
 
-        elapsed = time.time() - start_time
-        logging.info(
-            f"Episode {episode.episode_index}: {elapsed:.2f}s - "
-            f"quality={quality['aggregate']:.3f}, execution={execution_score:.3f}"
-        )
-
-        writer.add_episode(
-            {
-                "repo_id": loaded_dataset.repo_id,
-                "dataset_family": args.dataset_family,
-                "episode_index": episode.episode_index,
-                "task": episode.task,
-                "label": episode.label,
-                "quality_score": quality["aggregate"],
-                "execution_score": execution_score,
-                "execution_probability": execution_probability,
-                "combined_score": quality["aggregate"] * execution_score,
-                "runtime_seconds": quality["runtime_seconds"],
-                "quality_components": quality,
-                "execution_backend": args.execution_backend,
-                "vlm_response": vlm_response,
-                "reasoning_trace": reasoning_trace,
-                "camera_used": camera_used,
-            }
-        )
-
-    writer.finalize()
+            writer.add_episode(
+                {
+                    "repo_id": loaded_dataset.repo_id,
+                    "dataset_family": args.dataset_family,
+                    "episode_index": episode.episode_index,
+                    "task": episode.task,
+                    "label": episode.label,
+                    "quality_score": quality["aggregate"],
+                    "execution_score": execution_score,
+                    "execution_probability": execution_probability,
+                    "combined_score": quality["aggregate"] * execution_score,
+                    "runtime_seconds": quality["runtime_seconds"],
+                    "quality_components": quality,
+                    "execution_backend": args.execution_backend,
+                    "vlm_response": vlm_response,
+                    "reasoning_trace": reasoning_trace,
+                    "camera_used": camera_used,
+                }
+            )
+    except KeyboardInterrupt:
+        print("\nInterrupted. Partial outputs were written to disk.")
+        raise SystemExit(130) from None
+    finally:
+        if execution_scorer is not None:
+            execution_scorer.close()
+        writer.finalize()
 
 
 if __name__ == "__main__":

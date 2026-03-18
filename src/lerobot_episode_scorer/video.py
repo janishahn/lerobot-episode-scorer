@@ -56,7 +56,6 @@ def _sample_frames_at_times(
 
     with av.open(str(segment.video_path)) as container:
         stream = container.streams.video[0]
-        stream.thread_type = "AUTO"
         start_pts = int(segment.from_timestamp / float(stream.time_base))
         if start_pts > 0:
             container.seek(start_pts, stream=stream, backward=True)

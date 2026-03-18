@@ -1,11 +1,10 @@
-import base64
 import csv
 import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 from PIL import Image
@@ -18,6 +17,8 @@ from lerobot_episode_scorer.execution import (
     DEFAULT_MAX_IMAGE_SIDE,
     LMStudioVLMScorer,
     OllamaVLMScorer,
+    _score_with_lmstudio_request,
+    _score_with_ollama_request,
     parse_success_response,
     stitch_frames,
 )
@@ -100,22 +101,16 @@ class TestLMStudioVLMScorer(unittest.TestCase):
         scorer = LMStudioVLMScorer()
         self.assertFalse(scorer.think)
 
-    @patch("lerobot_episode_scorer.execution.urlopen")
-    def test_score_episode_calls_lmstudio_chat_completions(self, mock_urlopen: MagicMock) -> None:
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps(
-            {
-                "choices": [
-                    {
-                        "message": {
-                            "content": '{"success": "yes"}',
-                        }
-                    }
-                ]
-            }
-        ).encode("utf-8")
-        mock_urlopen.return_value.__enter__.return_value = mock_response
-
+    @patch.object(LMStudioVLMScorer, "_call_worker")
+    def test_score_episode_calls_lmstudio_chat_completions(
+        self, mock_call_worker: MagicMock
+    ) -> None:
+        mock_call_worker.return_value = {
+            "score": 1.0,
+            "probability": 1.0,
+            "raw_response": "yes",
+            "reasoning_trace": None,
+        }
         episode = MagicMock()
         episode.task = "pick and place the object"
         episode.cameras = {
@@ -140,36 +135,20 @@ class TestLMStudioVLMScorer(unittest.TestCase):
         self.assertEqual(result["camera_used"], "observation.images.top")
         self.assertEqual(result["raw_response"], "yes")
         self.assertIsNone(result["reasoning_trace"])
+        request = mock_call_worker.call_args.args[0]
+        self.assertIn("pick and place the object", request["prompt"])
+        self.assertIsInstance(request["image_bytes"], bytes)
 
-        request = mock_urlopen.call_args.args[0]
-        self.assertEqual(request.full_url, f"{DEFAULT_LMSTUDIO_BASE_URL}/chat/completions")
-        payload = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(payload["model"], DEFAULT_LMSTUDIO_MODEL)
-        self.assertEqual(payload["response_format"]["type"], "json_schema")
-        self.assertEqual(
-            payload["response_format"]["json_schema"]["schema"]["required"], ["success"]
-        )
-
-    @patch("lerobot_episode_scorer.execution.urlopen")
+    @patch.object(LMStudioVLMScorer, "_call_worker")
     def test_score_episode_with_think_keeps_reasoning_separate(
-        self, mock_urlopen: MagicMock
+        self, mock_call_worker: MagicMock
     ) -> None:
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps(
-            {
-                "choices": [
-                    {
-                        "message": {
-                            "content": (
-                                '{"reasoning": "The cube ends inside the container.", '
-                                '"success": "yes"}'
-                            ),
-                        }
-                    }
-                ]
-            }
-        ).encode("utf-8")
-        mock_urlopen.return_value.__enter__.return_value = mock_response
+        mock_call_worker.return_value = {
+            "score": 1.0,
+            "probability": 1.0,
+            "raw_response": "yes",
+            "reasoning_trace": "The cube ends inside the container.",
+        }
 
         episode = MagicMock()
         episode.task = "pick and place the object"
@@ -188,29 +167,18 @@ class TestLMStudioVLMScorer(unittest.TestCase):
 
         self.assertEqual(result["raw_response"], "yes")
         self.assertEqual(result["reasoning_trace"], "The cube ends inside the container.")
+        self.assertIn("pick and place the object", mock_call_worker.call_args.args[0]["prompt"])
 
-        request = mock_urlopen.call_args.args[0]
-        payload = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(
-            payload["response_format"]["json_schema"]["schema"]["required"],
-            ["reasoning", "success"],
-        )
-
-    @patch("lerobot_episode_scorer.execution.urlopen")
-    def test_score_episode_downscales_image_before_request(self, mock_urlopen: MagicMock) -> None:
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps(
-            {
-                "choices": [
-                    {
-                        "message": {
-                            "content": '{"success": "yes"}',
-                        }
-                    }
-                ]
-            }
-        ).encode("utf-8")
-        mock_urlopen.return_value.__enter__.return_value = mock_response
+    @patch.object(LMStudioVLMScorer, "_call_worker")
+    def test_score_episode_downscales_image_before_request(
+        self, mock_call_worker: MagicMock
+    ) -> None:
+        mock_call_worker.return_value = {
+            "score": 1.0,
+            "probability": 1.0,
+            "raw_response": "yes",
+            "reasoning_trace": None,
+        }
 
         episode = MagicMock()
         episode.task = "test task"
@@ -227,29 +195,60 @@ class TestLMStudioVLMScorer(unittest.TestCase):
             scorer = LMStudioVLMScorer(max_image_side=448)
             scorer.score_episode(episode)
 
+        image = Image.open(io.BytesIO(mock_call_worker.call_args.args[0]["image_bytes"]))
+        self.assertEqual(image.size, (448, 257))
+
+    @patch("lerobot_episode_scorer.execution.urlopen")
+    def test_lmstudio_worker_with_think_requires_reasoning(self, mock_urlopen: MagicMock) -> None:
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"reasoning": "The cube ends inside the container.", '
+                                '"success": "yes"}'
+                            ),
+                        }
+                    }
+                ]
+            }
+        ).encode("utf-8")
+        mock_urlopen.return_value.__enter__.return_value = mock_response
+        result = _score_with_lmstudio_request(
+            DEFAULT_LMSTUDIO_MODEL,
+            DEFAULT_LMSTUDIO_BASE_URL,
+            "Pick and place the object.",
+            b"image-bytes",
+            True,
+            128,
+            5.0,
+        )
+
         request = mock_urlopen.call_args.args[0]
         payload = json.loads(request.data.decode("utf-8"))
-        image_url = payload["messages"][1]["content"][1]["image_url"]["url"]
-        image_bytes = image_url.split(",", maxsplit=1)[1].encode("utf-8")
-        image = Image.open(io.BytesIO(base64.b64decode(image_bytes)))
-        self.assertEqual(image.size, (448, 257))
+        self.assertEqual(
+            payload["response_format"]["json_schema"]["schema"]["required"],
+            ["reasoning", "success"],
+        )
+        self.assertEqual(result["reasoning_trace"], "The cube ends inside the container.")
 
 
 class TestOllamaVLMScorer(unittest.TestCase):
-    @patch("lerobot_episode_scorer.execution.ollama.Client")
-    def test_scorer_disables_thinking_by_default(self, mock_client_class: MagicMock) -> None:
-        mock_client_class.return_value = MagicMock()
-
+    def test_scorer_disables_thinking_by_default(self) -> None:
         scorer = OllamaVLMScorer()
 
         self.assertFalse(scorer.think)
 
-    @patch("lerobot_episode_scorer.execution.ollama.Client")
-    def test_score_episode_calls_ollama_generate(self, mock_client_class: MagicMock) -> None:
-        mock_client = MagicMock()
-        mock_client.generate.return_value = {"response": "Yes, the task was successful."}
-        mock_client_class.return_value = mock_client
-
+    @patch.object(OllamaVLMScorer, "_call_worker")
+    def test_score_episode_calls_ollama_generate(self, mock_call_worker: MagicMock) -> None:
+        mock_call_worker.return_value = {
+            "score": 1.0,
+            "probability": 1.0,
+            "raw_response": "Yes, the task was successful.",
+            "reasoning_trace": None,
+        }
         episode = MagicMock()
         episode.task = "pick and place the object"
         episode.cameras = {
@@ -269,17 +268,16 @@ class TestOllamaVLMScorer(unittest.TestCase):
         self.assertEqual(result["probability"], 1.0)
         self.assertEqual(result["camera_used"], "observation.images.top")
         self.assertEqual(result["raw_response"], "Yes, the task was successful.")
-        mock_client.generate.assert_called_once()
-        self.assertFalse(mock_client.generate.call_args.kwargs["think"])
+        self.assertIn("pick and place the object", mock_call_worker.call_args.args[0]["prompt"])
 
-    @patch("lerobot_episode_scorer.execution.ollama.Client")
-    def test_score_episode_captures_reasoning_trace(self, mock_client_class: MagicMock) -> None:
-        mock_client = MagicMock()
-        mock_client.generate.return_value = {
-            "response": "Yes, successful.",
-            "thinking": "Let me analyze each frame...",
+    @patch.object(OllamaVLMScorer, "_call_worker")
+    def test_score_episode_captures_reasoning_trace(self, mock_call_worker: MagicMock) -> None:
+        mock_call_worker.return_value = {
+            "score": 1.0,
+            "probability": 1.0,
+            "raw_response": "Yes, successful.",
+            "reasoning_trace": "Let me analyze each frame...",
         }
-        mock_client_class.return_value = mock_client
 
         episode = MagicMock()
         episode.task = "test task"
@@ -297,21 +295,17 @@ class TestOllamaVLMScorer(unittest.TestCase):
             result = scorer.score_episode(episode)
 
         self.assertEqual(result["reasoning_trace"], "Let me analyze each frame...")
-        mock_client.generate.assert_called_once_with(
-            model=scorer.model,
-            prompt=ANY,
-            images=ANY,
-            think=True,
-            keep_alive=scorer.keep_alive,
-        )
 
-    @patch("lerobot_episode_scorer.execution.ollama.Client")
+    @patch.object(OllamaVLMScorer, "_call_worker")
     def test_score_episode_keeps_image_size_when_downscaling_disabled(
-        self, mock_client_class: MagicMock
+        self, mock_call_worker: MagicMock
     ) -> None:
-        mock_client = MagicMock()
-        mock_client.generate.return_value = {"response": "yes"}
-        mock_client_class.return_value = mock_client
+        mock_call_worker.return_value = {
+            "score": 1.0,
+            "probability": 1.0,
+            "raw_response": "yes",
+            "reasoning_trace": None,
+        }
 
         episode = MagicMock()
         episode.task = "test task"
@@ -328,9 +322,35 @@ class TestOllamaVLMScorer(unittest.TestCase):
             scorer = OllamaVLMScorer(max_image_side=None)
             scorer.score_episode(episode)
 
-        image_bytes = mock_client.generate.call_args.kwargs["images"][0]
+        image_bytes = mock_call_worker.call_args.args[0]["image_bytes"]
         image = Image.open(io.BytesIO(image_bytes))
         self.assertEqual(image.size, (900, 516))
+
+    @patch("lerobot_episode_scorer.execution.ollama.Client")
+    def test_ollama_worker_captures_reasoning_trace(self, mock_client_class: MagicMock) -> None:
+        mock_client = MagicMock()
+        mock_client.generate.return_value = {
+            "response": "Yes, successful.",
+            "thinking": "Let me analyze each frame...",
+        }
+        mock_client_class.return_value = mock_client
+        result = _score_with_ollama_request(
+            "model",
+            "http://localhost:11434",
+            "prompt",
+            b"image-bytes",
+            True,
+            300.0,
+        )
+
+        mock_client.generate.assert_called_once_with(
+            model="model",
+            prompt="prompt",
+            images=[b"image-bytes"],
+            think=True,
+            keep_alive=300.0,
+        )
+        self.assertEqual(result["reasoning_trace"], "Let me analyze each frame...")
 
 
 class TestComputeSummary(unittest.TestCase):
