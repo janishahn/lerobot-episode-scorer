@@ -4,6 +4,7 @@ import random
 import time
 from pathlib import Path
 
+from dotenv import load_dotenv
 from PIL import Image
 from tqdm import tqdm
 
@@ -11,12 +12,14 @@ from lerobot_episode_scorer.dataset import load_lerobot_dataset
 from lerobot_episode_scorer.execution import (
     DEFAULT_BORDER_SIZE,
     DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+    DEFAULT_GEMINI_MODEL,
     DEFAULT_LMSTUDIO_BASE_URL,
     DEFAULT_LMSTUDIO_MODEL,
     DEFAULT_OLLAMA_HOST,
     DEFAULT_OLLAMA_MODEL,
     ExecutionBackendError,
     ExecutionBackendTimeoutError,
+    GeminiVLMScorer,
     LMStudioVLMScorer,
     OllamaVLMScorer,
 )
@@ -58,10 +61,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Runtime target used for runtime scoring. Defaults to the dataset median runtime.",
     )
     parser.add_argument(
+        "--instruction",
+        default=None,
+        help="Override the dataset task instruction used for VLM execution scoring.",
+    )
+    parser.add_argument(
         "--execution-backend",
-        choices=["none", "lmstudio", "ollama"],
-        default="lmstudio",
-        help="Execution backend: 'none', 'lmstudio' (default), or 'ollama'.",
+        choices=["none", "gemini", "lmstudio", "ollama"],
+        default="gemini",
+        help="Execution backend: 'none', 'gemini' (default), 'lmstudio', or 'ollama'.",
+    )
+    parser.add_argument(
+        "--gemini-model",
+        default=DEFAULT_GEMINI_MODEL,
+        help=f"Gemini model to use (default: {DEFAULT_GEMINI_MODEL}).",
     )
     parser.add_argument(
         "--lmstudio-model",
@@ -122,7 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_EXECUTION_TIMEOUT_SECONDS,
         help=(
-            "Maximum time to wait for a single LM Studio or Ollama scoring request before "
+            "Maximum time to wait for a single Gemini, LM Studio, or Ollama scoring request before "
             "marking that episode's execution score as unknown."
         ),
     )
@@ -130,6 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    load_dotenv()
     logging.basicConfig(
         filename="scoring.log",
         level=logging.INFO,
@@ -153,7 +167,16 @@ def main() -> None:
     execution_model = ""
     pre_extracted_frames: dict[int, dict[str, Image.Image]] = {}
 
-    if args.execution_backend == "lmstudio":
+    if args.execution_backend == "gemini":
+        execution_scorer = GeminiVLMScorer(
+            model=args.gemini_model,
+            border_size=args.stitch_border_size,
+            think=args.think,
+            timeout_seconds=args.execution_timeout_seconds,
+        )
+        execution_model = args.gemini_model
+        print(f"Using Gemini VLM scorer with model {args.gemini_model}")
+    elif args.execution_backend == "lmstudio":
         execution_scorer = LMStudioVLMScorer(
             model=args.lmstudio_model,
             base_url=args.lmstudio_base_url,
@@ -240,6 +263,7 @@ def main() -> None:
         for episode in tqdm(loaded_dataset.episodes, desc="Scoring episodes", unit="episode"):
             start_time = time.time()
             quality = quality_scorer.score_episode(episode)
+            execution_task = args.instruction if args.instruction is not None else episode.task
 
             if execution_scorer is None:
                 execution_score = 1.0
@@ -250,7 +274,9 @@ def main() -> None:
             else:
                 try:
                     result = execution_scorer.score_episode(
-                        episode, pre_extracted=pre_extracted_frames.get(episode.episode_index)
+                        episode,
+                        task=execution_task,
+                        pre_extracted=pre_extracted_frames.get(episode.episode_index),
                     )
                     execution_score = result["score"]
                     execution_probability = result["probability"]
@@ -280,7 +306,7 @@ def main() -> None:
                     "repo_id": loaded_dataset.repo_id,
                     "dataset_family": args.dataset_family,
                     "episode_index": episode.episode_index,
-                    "task": episode.task,
+                    "task": execution_task,
                     "label": episode.label,
                     "quality_score": quality["aggregate"],
                     "execution_score": execution_score,

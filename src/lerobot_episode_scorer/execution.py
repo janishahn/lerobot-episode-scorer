@@ -4,6 +4,8 @@ import base64
 import io
 import json
 import multiprocessing as mp
+import os
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import ollama
@@ -14,6 +16,8 @@ from lerobot_episode_scorer.video import sample_episode_frames
 
 DEFAULT_OLLAMA_MODEL = "qwen3.5:0.8b"
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
+DEFAULT_GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 DEFAULT_LMSTUDIO_MODEL = "qwen/qwen3.5-9b"
 DEFAULT_LMSTUDIO_BASE_URL = "http://localhost:1234/v1"
 DEFAULT_BORDER_SIZE = 4
@@ -170,8 +174,15 @@ def _score_with_lmstudio_request(
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urlopen(request, timeout=timeout_seconds) as response:
-        response_json = json.loads(response.read().decode("utf-8"))
+    try:
+        with urlopen(request, timeout=timeout_seconds) as response:
+            response_json = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace").strip()
+        message = f"HTTP Error {exc.code}: {exc.reason}"
+        if error_body:
+            message = f"{message} - {error_body}"
+        raise ValueError(message) from exc
 
     message = response_json["choices"][0]["message"]
     content = message.get("content", "")
@@ -181,6 +192,108 @@ def _score_with_lmstudio_request(
     if think:
         reasoning_trace = str(parsed_content["reasoning"])
     probability, _ = parse_success_response(raw_response)
+    return {
+        "score": probability,
+        "probability": probability,
+        "raw_response": raw_response,
+        "reasoning_trace": reasoning_trace,
+    }
+
+
+def _score_with_gemini_request(
+    model: str,
+    api_url: str,
+    api_key: str,
+    prompt: str,
+    image_bytes: bytes,
+    think: bool,
+    timeout_seconds: float,
+) -> dict:
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    generation_config: dict[str, object] = {
+        "responseMimeType": "application/json",
+        "responseJsonSchema": {
+            "type": "object",
+            "properties": {
+                "success": {"type": "string", "enum": ["yes", "no"]},
+            },
+            "required": ["success"],
+            "additionalProperties": False,
+        },
+        "thinkingConfig": {
+            "thinkingLevel": "low" if think else "minimal",
+        },
+    }
+    if think:
+        generation_config["thinkingConfig"] = {
+            "includeThoughts": True,
+            "thinkingLevel": "low",
+        }
+
+    request = Request(
+        f"{api_url}/{model}:generateContent",
+        data=json.dumps(
+            {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {
+                                "inline_data": {
+                                    "mime_type": "image/jpeg",
+                                    "data": image_b64,
+                                }
+                            },
+                            {"text": prompt},
+                        ],
+                    }
+                ],
+                "generationConfig": generation_config,
+            }
+        ).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout_seconds) as response:
+            response_json = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace").strip()
+        message = f"HTTP Error {exc.code}: {exc.reason}"
+        if error_body:
+            message = f"{message} - {error_body}"
+        raise ValueError(message) from exc
+
+    candidates = response_json.get("candidates")
+    if not candidates:
+        raise ValueError("Gemini response did not include candidates")
+
+    parts = candidates[0]["content"].get("parts")
+    if not parts:
+        raise ValueError("Gemini response did not include content parts")
+
+    reasoning_parts: list[str] = []
+    json_text = None
+    for part in parts:
+        part_text = part.get("text")
+        if not part_text:
+            continue
+        if part.get("thought"):
+            reasoning_parts.append(part_text)
+            continue
+        json_text = part_text
+
+    if json_text is None:
+        raise ValueError("Gemini response did not include a JSON payload")
+
+    parsed_content = json.loads(json_text)
+    raw_response = str(parsed_content["success"])
+    probability, _ = parse_success_response(raw_response)
+    reasoning_trace = "\n".join(reasoning_parts) if reasoning_parts else None
     return {
         "score": probability,
         "probability": probability,
@@ -261,6 +374,50 @@ def _lmstudio_worker_loop(
                         image_bytes=image_bytes,
                         think=think,
                         max_tokens=max_tokens,
+                        timeout_seconds=timeout_seconds,
+                    ),
+                }
+            except (json.JSONDecodeError, KeyError, OSError, TimeoutError, ValueError) as exc:
+                response = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+            try:
+                connection.send(response)
+            except (BrokenPipeError, EOFError, OSError):
+                break
+    finally:
+        connection.close()
+
+
+def _gemini_worker_loop(
+    model: str,
+    api_url: str,
+    api_key: str,
+    think: bool,
+    timeout_seconds: float,
+    connection,
+) -> None:
+    try:
+        while True:
+            try:
+                request = connection.recv()
+            except EOFError:
+                break
+
+            if request is None:
+                break
+
+            prompt = request["prompt"]
+            image_bytes = request["image_bytes"]
+            try:
+                response = {
+                    "ok": True,
+                    "value": _score_with_gemini_request(
+                        model=model,
+                        api_url=api_url,
+                        api_key=api_key,
+                        prompt=prompt,
+                        image_bytes=image_bytes,
+                        think=think,
                         timeout_seconds=timeout_seconds,
                     ),
                 }
@@ -470,12 +627,13 @@ class OllamaVLMScorer(BaseVLMScorer):
     def score_episode(
         self,
         episode: EpisodeRecord,
+        task: str | None = None,
         camera_key: str | None = None,
         pre_extracted: dict[str, Image.Image] | None = None,
     ) -> dict:
         selected_camera = self._select_camera(episode, camera_key)
         stitched_image = self._get_stitched_image(episode, selected_camera, pre_extracted)
-        prompt = self._build_prompt(episode.task)
+        prompt = self._build_prompt(task if task is not None else episode.task)
         image_bytes = self._encode_image(stitched_image)
         result = self._call_worker({"prompt": prompt, "image_bytes": image_bytes})
 
@@ -520,6 +678,7 @@ class LMStudioVLMScorer(BaseVLMScorer):
     def score_episode(
         self,
         episode: EpisodeRecord,
+        task: str | None = None,
         camera_key: str | None = None,
         pre_extracted: dict[str, Image.Image] | None = None,
     ) -> dict:
@@ -528,10 +687,62 @@ class LMStudioVLMScorer(BaseVLMScorer):
         image_bytes = self._encode_image(stitched_image)
         result = self._call_worker(
             {
-                "prompt": self._build_prompt(episode.task),
+                "prompt": self._build_prompt(task if task is not None else episode.task),
                 "image_bytes": image_bytes,
             }
         )
+
+        return {
+            **result,
+            "camera_used": selected_camera,
+        }
+
+
+class GeminiVLMScorer(BaseVLMScorer):
+    def __init__(
+        self,
+        model: str = DEFAULT_GEMINI_MODEL,
+        api_url: str = DEFAULT_GEMINI_API_URL,
+        border_size: int = DEFAULT_BORDER_SIZE,
+        think: bool = False,
+        max_image_side: int | None = DEFAULT_MAX_IMAGE_SIDE,
+        timeout_seconds: float = DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+    ) -> None:
+        super().__init__(
+            border_size=border_size,
+            max_image_side=max_image_side,
+            timeout_seconds=timeout_seconds,
+        )
+        self.model = model
+        self.api_url = api_url.rstrip("/")
+        self.think = think
+        self.api_key = os.environ.get("GEMINI_API_KEY")
+        if not self.api_key:
+            raise ValueError("GEMINI_API_KEY is not set")
+        self._configure_worker(
+            backend_name="Gemini",
+            worker_target=_gemini_worker_loop,
+            worker_args=(
+                self.model,
+                self.api_url,
+                self.api_key,
+                self.think,
+                self.timeout_seconds,
+            ),
+        )
+
+    def score_episode(
+        self,
+        episode: EpisodeRecord,
+        task: str | None = None,
+        camera_key: str | None = None,
+        pre_extracted: dict[str, Image.Image] | None = None,
+    ) -> dict:
+        selected_camera = self._select_camera(episode, camera_key)
+        stitched_image = self._get_stitched_image(episode, selected_camera, pre_extracted)
+        prompt = self._build_prompt(task if task is not None else episode.task)
+        image_bytes = self._encode_image(stitched_image)
+        result = self._call_worker({"prompt": prompt, "image_bytes": image_bytes})
 
         return {
             **result,
