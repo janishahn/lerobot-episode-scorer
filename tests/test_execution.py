@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from urllib.error import HTTPError
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -12,11 +13,15 @@ from PIL import Image
 from lerobot_episode_scorer.execution import (
     DEFAULT_BORDER_SIZE,
     DEFAULT_FRAMES_PER_EPISODE,
+    DEFAULT_GEMINI_API_URL,
+    DEFAULT_GEMINI_MODEL,
     DEFAULT_LMSTUDIO_BASE_URL,
     DEFAULT_LMSTUDIO_MODEL,
     DEFAULT_MAX_IMAGE_SIDE,
+    GeminiVLMScorer,
     LMStudioVLMScorer,
     OllamaVLMScorer,
+    _score_with_gemini_request,
     _score_with_lmstudio_request,
     _score_with_ollama_request,
     parse_success_response,
@@ -198,6 +203,35 @@ class TestLMStudioVLMScorer(unittest.TestCase):
         image = Image.open(io.BytesIO(mock_call_worker.call_args.args[0]["image_bytes"]))
         self.assertEqual(image.size, (448, 257))
 
+    @patch.object(LMStudioVLMScorer, "_call_worker")
+    def test_score_episode_uses_task_override_when_provided(
+        self, mock_call_worker: MagicMock
+    ) -> None:
+        mock_call_worker.return_value = {
+            "score": 1.0,
+            "probability": 1.0,
+            "raw_response": "yes",
+            "reasoning_trace": None,
+        }
+        episode = MagicMock()
+        episode.task = "dataset task"
+        episode.cameras = {
+            "observation.images.top": MagicMock(
+                video_path="/tmp/test.mp4",
+                from_timestamp=0.0,
+                to_timestamp=10.0,
+            )
+        }
+
+        with patch("lerobot_episode_scorer.execution.sample_episode_frames") as mock_sample:
+            mock_sample.return_value = [np.zeros((100, 100, 3), dtype=np.uint8) for _ in range(4)]
+            scorer = LMStudioVLMScorer()
+            scorer.score_episode(episode, task="manual override")
+
+        prompt = mock_call_worker.call_args.args[0]["prompt"]
+        self.assertIn("manual override", prompt)
+        self.assertNotIn("dataset task", prompt)
+
     @patch("lerobot_episode_scorer.execution.urlopen")
     def test_lmstudio_worker_with_think_requires_reasoning(self, mock_urlopen: MagicMock) -> None:
         mock_response = MagicMock()
@@ -233,6 +267,305 @@ class TestLMStudioVLMScorer(unittest.TestCase):
             ["reasoning", "success"],
         )
         self.assertEqual(result["reasoning_trace"], "The cube ends inside the container.")
+
+    @patch("lerobot_episode_scorer.execution.urlopen")
+    def test_lmstudio_http_error_includes_response_body(self, mock_urlopen: MagicMock) -> None:
+        mock_urlopen.side_effect = HTTPError(
+            url="http://localhost:1234/v1/chat/completions",
+            code=400,
+            msg="Bad Request",
+            hdrs=None,
+            fp=io.BytesIO(b'{"error":{"message":"insufficient system resources"}}'),
+        )
+
+        with self.assertRaises(ValueError) as context:
+            _score_with_lmstudio_request(
+                DEFAULT_LMSTUDIO_MODEL,
+                DEFAULT_LMSTUDIO_BASE_URL,
+                "Pick and place the object.",
+                b"image-bytes",
+                False,
+                128,
+                5.0,
+            )
+
+        self.assertIn("HTTP Error 400: Bad Request", str(context.exception))
+        self.assertIn("insufficient system resources", str(context.exception))
+
+
+class TestGeminiVLMScorer(unittest.TestCase):
+    def test_default_constants(self) -> None:
+        self.assertEqual(DEFAULT_GEMINI_MODEL, "gemini-flash-latest")
+        self.assertEqual(
+            DEFAULT_GEMINI_API_URL, "https://generativelanguage.googleapis.com/v1beta/models"
+        )
+
+    @patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"})
+    def test_scorer_disables_reasoning_by_default(self) -> None:
+        scorer = GeminiVLMScorer()
+        self.assertFalse(scorer.think)
+
+    @patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"})
+    @patch.object(GeminiVLMScorer, "_call_worker")
+    def test_score_episode_calls_gemini_generate_content(self, mock_call_worker: MagicMock) -> None:
+        mock_call_worker.return_value = {
+            "score": 1.0,
+            "probability": 1.0,
+            "raw_response": "yes",
+            "reasoning_trace": None,
+        }
+        episode = MagicMock()
+        episode.task = "pick and place the object"
+        episode.cameras = {
+            "observation.images.top": MagicMock(
+                video_path="/tmp/test.mp4",
+                from_timestamp=0.0,
+                to_timestamp=10.0,
+            )
+        }
+
+        with patch("lerobot_episode_scorer.execution.sample_episode_frames") as mock_sample:
+            mock_sample.return_value = [np.zeros((100, 100, 3), dtype=np.uint8) for _ in range(4)]
+            scorer = GeminiVLMScorer()
+            result = scorer.score_episode(episode)
+
+        self.assertEqual(result["score"], 1.0)
+        self.assertEqual(result["probability"], 1.0)
+        self.assertEqual(result["camera_used"], "observation.images.top")
+        self.assertEqual(result["raw_response"], "yes")
+        request = mock_call_worker.call_args.args[0]
+        self.assertIn("pick and place the object", request["prompt"])
+        self.assertIsInstance(request["image_bytes"], bytes)
+
+    @patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"})
+    @patch.object(GeminiVLMScorer, "_call_worker")
+    def test_score_episode_with_think_keeps_reasoning_separate(
+        self, mock_call_worker: MagicMock
+    ) -> None:
+        mock_call_worker.return_value = {
+            "score": 1.0,
+            "probability": 1.0,
+            "raw_response": "yes",
+            "reasoning_trace": "The object ends in the tray.",
+        }
+        episode = MagicMock()
+        episode.task = "pick and place the object"
+        episode.cameras = {
+            "observation.images.top": MagicMock(
+                video_path="/tmp/test.mp4",
+                from_timestamp=0.0,
+                to_timestamp=10.0,
+            )
+        }
+
+        with patch("lerobot_episode_scorer.execution.sample_episode_frames") as mock_sample:
+            mock_sample.return_value = [np.zeros((100, 100, 3), dtype=np.uint8) for _ in range(4)]
+            scorer = GeminiVLMScorer(think=True)
+            result = scorer.score_episode(episode)
+
+        self.assertEqual(result["reasoning_trace"], "The object ends in the tray.")
+        self.assertIn("pick and place the object", mock_call_worker.call_args.args[0]["prompt"])
+
+    @patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"})
+    @patch.object(GeminiVLMScorer, "_call_worker")
+    def test_score_episode_downscales_image_before_request(
+        self, mock_call_worker: MagicMock
+    ) -> None:
+        mock_call_worker.return_value = {
+            "score": 1.0,
+            "probability": 1.0,
+            "raw_response": "yes",
+            "reasoning_trace": None,
+        }
+        episode = MagicMock()
+        episode.task = "test task"
+        episode.cameras = {
+            "observation.images.top": MagicMock(
+                video_path="/tmp/test.mp4",
+                from_timestamp=0.0,
+                to_timestamp=5.0,
+            )
+        }
+
+        with patch("lerobot_episode_scorer.execution.sample_episode_frames") as mock_sample:
+            mock_sample.return_value = [np.zeros((256, 448, 3), dtype=np.uint8) for _ in range(4)]
+            scorer = GeminiVLMScorer(max_image_side=448)
+            scorer.score_episode(episode)
+
+        image = Image.open(io.BytesIO(mock_call_worker.call_args.args[0]["image_bytes"]))
+        self.assertEqual(image.size, (448, 257))
+
+    @patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"})
+    @patch.object(GeminiVLMScorer, "_call_worker")
+    def test_score_episode_uses_task_override_when_provided(
+        self, mock_call_worker: MagicMock
+    ) -> None:
+        mock_call_worker.return_value = {
+            "score": 1.0,
+            "probability": 1.0,
+            "raw_response": "yes",
+            "reasoning_trace": None,
+        }
+        episode = MagicMock()
+        episode.task = "dataset task"
+        episode.cameras = {
+            "observation.images.top": MagicMock(
+                video_path="/tmp/test.mp4",
+                from_timestamp=0.0,
+                to_timestamp=10.0,
+            )
+        }
+
+        with patch("lerobot_episode_scorer.execution.sample_episode_frames") as mock_sample:
+            mock_sample.return_value = [np.zeros((100, 100, 3), dtype=np.uint8) for _ in range(4)]
+            scorer = GeminiVLMScorer()
+            scorer.score_episode(episode, task="manual override")
+
+        prompt = mock_call_worker.call_args.args[0]["prompt"]
+        self.assertIn("manual override", prompt)
+        self.assertNotIn("dataset task", prompt)
+
+    def test_missing_api_key_raises_value_error(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            with self.assertRaises(ValueError) as context:
+                GeminiVLMScorer()
+        self.assertIn("GEMINI_API_KEY", str(context.exception))
+
+    @patch("lerobot_episode_scorer.execution.urlopen")
+    def test_gemini_request_uses_structured_output_and_minimal_thinking(
+        self, mock_urlopen: MagicMock
+    ) -> None:
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": '{"success":"yes"}',
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        ).encode("utf-8")
+        mock_urlopen.return_value.__enter__.return_value = mock_response
+
+        result = _score_with_gemini_request(
+            DEFAULT_GEMINI_MODEL,
+            DEFAULT_GEMINI_API_URL,
+            "test-key",
+            "Pick and place the object.",
+            b"image-bytes",
+            False,
+            5.0,
+        )
+
+        request = mock_urlopen.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(
+            request.full_url, f"{DEFAULT_GEMINI_API_URL}/{DEFAULT_GEMINI_MODEL}:generateContent"
+        )
+        self.assertEqual(request.headers["X-goog-api-key"], "test-key")
+        self.assertEqual(
+            payload["contents"][0]["parts"][0]["inline_data"]["mime_type"],
+            "image/jpeg",
+        )
+        self.assertEqual(payload["contents"][0]["parts"][1]["text"], "Pick and place the object.")
+        self.assertEqual(payload["generationConfig"]["responseMimeType"], "application/json")
+        self.assertEqual(
+            payload["generationConfig"]["responseJsonSchema"]["properties"]["success"]["enum"],
+            ["yes", "no"],
+        )
+        self.assertEqual(
+            payload["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "minimal",
+        )
+        self.assertEqual(result["raw_response"], "yes")
+        self.assertIsNone(result["reasoning_trace"])
+
+    @patch("lerobot_episode_scorer.execution.urlopen")
+    def test_gemini_request_with_think_collects_thought_parts(
+        self, mock_urlopen: MagicMock
+    ) -> None:
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {"text": "First thought.", "thought": True},
+                                {"text": "Second thought.", "thought": True},
+                                {"text": '{"success":"yes"}'},
+                            ]
+                        }
+                    }
+                ]
+            }
+        ).encode("utf-8")
+        mock_urlopen.return_value.__enter__.return_value = mock_response
+
+        result = _score_with_gemini_request(
+            DEFAULT_GEMINI_MODEL,
+            DEFAULT_GEMINI_API_URL,
+            "test-key",
+            "prompt",
+            b"image-bytes",
+            True,
+            5.0,
+        )
+
+        request = mock_urlopen.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(payload["generationConfig"]["thinkingConfig"]["thinkingLevel"], "low")
+        self.assertTrue(payload["generationConfig"]["thinkingConfig"]["includeThoughts"])
+        self.assertEqual(result["reasoning_trace"], "First thought.\nSecond thought.")
+
+    @patch("lerobot_episode_scorer.execution.urlopen")
+    def test_gemini_request_requires_candidates(self, mock_urlopen: MagicMock) -> None:
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({"candidates": []}).encode("utf-8")
+        mock_urlopen.return_value.__enter__.return_value = mock_response
+
+        with self.assertRaises(ValueError) as context:
+            _score_with_gemini_request(
+                DEFAULT_GEMINI_MODEL,
+                DEFAULT_GEMINI_API_URL,
+                "test-key",
+                "prompt",
+                b"image-bytes",
+                False,
+                5.0,
+            )
+
+        self.assertIn("did not include candidates", str(context.exception))
+
+    @patch("lerobot_episode_scorer.execution.urlopen")
+    def test_gemini_http_error_includes_response_body(self, mock_urlopen: MagicMock) -> None:
+        mock_urlopen.side_effect = HTTPError(
+            url="https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent",
+            code=429,
+            msg="Too Many Requests",
+            hdrs=None,
+            fp=io.BytesIO(b'{"error":{"message":"quota exceeded"}}'),
+        )
+
+        with self.assertRaises(ValueError) as context:
+            _score_with_gemini_request(
+                DEFAULT_GEMINI_MODEL,
+                DEFAULT_GEMINI_API_URL,
+                "test-key",
+                "prompt",
+                b"image-bytes",
+                False,
+                5.0,
+            )
+
+        self.assertIn("HTTP Error 429: Too Many Requests", str(context.exception))
+        self.assertIn("quota exceeded", str(context.exception))
 
 
 class TestOllamaVLMScorer(unittest.TestCase):
@@ -325,6 +658,35 @@ class TestOllamaVLMScorer(unittest.TestCase):
         image_bytes = mock_call_worker.call_args.args[0]["image_bytes"]
         image = Image.open(io.BytesIO(image_bytes))
         self.assertEqual(image.size, (900, 516))
+
+    @patch.object(OllamaVLMScorer, "_call_worker")
+    def test_score_episode_uses_task_override_when_provided(
+        self, mock_call_worker: MagicMock
+    ) -> None:
+        mock_call_worker.return_value = {
+            "score": 1.0,
+            "probability": 1.0,
+            "raw_response": "yes",
+            "reasoning_trace": None,
+        }
+        episode = MagicMock()
+        episode.task = "dataset task"
+        episode.cameras = {
+            "observation.images.top": MagicMock(
+                video_path="/tmp/test.mp4",
+                from_timestamp=0.0,
+                to_timestamp=5.0,
+            )
+        }
+
+        with patch("lerobot_episode_scorer.execution.sample_episode_frames") as mock_sample:
+            mock_sample.return_value = [np.zeros((100, 100, 3), dtype=np.uint8) for _ in range(4)]
+            scorer = OllamaVLMScorer()
+            scorer.score_episode(episode, task="manual override")
+
+        prompt = mock_call_worker.call_args.args[0]["prompt"]
+        self.assertIn("manual override", prompt)
+        self.assertNotIn("dataset task", prompt)
 
     @patch("lerobot_episode_scorer.execution.ollama.Client")
     def test_ollama_worker_captures_reasoning_trace(self, mock_client_class: MagicMock) -> None:

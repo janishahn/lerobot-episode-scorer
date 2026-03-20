@@ -4,6 +4,8 @@ from pathlib import Path
 import av
 import numpy as np
 
+VALIDATION_DURATION_TOLERANCE_SECONDS = 1e-3
+
 
 class VideoValidationError(Exception):
     """Raised when a video file fails pre-validation."""
@@ -39,14 +41,17 @@ def validate_video(segment: VideoSegment) -> None:
 
             stream = container.streams.video[0]
             duration = float(stream.duration * stream.time_base) if stream.duration else None
-            if duration is not None and segment.to_timestamp > duration:
+            if (
+                duration is not None
+                and segment.to_timestamp > duration + VALIDATION_DURATION_TOLERANCE_SECONDS
+            ):
                 raise VideoValidationError(
                     f"Segment end time {segment.to_timestamp}s exceeds video duration {duration}s: {path}"
                 )
     except av.error.InvalidDataError as e:
         raise VideoValidationError(f"Corrupted or invalid video file: {path}") from e
-    except av.error.UnsupportedError as e:
-        raise VideoValidationError(f"Unsupported video format: {path}") from e
+    except av.error.FFmpegError as e:
+        raise VideoValidationError(f"Could not open video file with FFmpeg: {path}") from e
 
 
 def _sample_frames_at_times(
